@@ -1,0 +1,1226 @@
+From 26d9f396a25e01831c0fa91bbe8c9bc94d2aafdb Mon Sep 17 00:00:00 2001
+From: Pavel Yaskevich <xedin@apache.org>
+Date: Mon, 2 Nov 2015 16:37:49 -0800
+Subject: [PATCH 03/10] cql3 changes (OR, parenthesis, etc.)
+
+---
+ src/java/org/apache/cassandra/cql3/Cql.g           |  75 +++++--
+ .../org/apache/cassandra/cql3/LogicalRelation.java |  51 +++++
+ src/java/org/apache/cassandra/cql3/Relation.java   |  49 +++-
+ .../apache/cassandra/cql3/RelationTreeBuilder.java | 201 +++++++++++++++++
+ .../cassandra/cql3/SingleColumnRelation.java       |   4 +-
+ .../cassandra/cql3/statements/Restriction.java     |   1 +
+ .../cassandra/cql3/statements/SelectStatement.java | 250 ++++++++++++++++-----
+ .../cql3/statements/SingleColumnRestriction.java   |  38 ++++
+ .../apache/cassandra/cql3/SelectStatementTest.java | 160 +++++++++++++
+ .../cassandra/cql3/SingleColumnRelationTest.java   |   4 +-
+ .../cql3/statements/SelectStatementTest.java       |  13 ++
+ 11 files changed, 764 insertions(+), 82 deletions(-)
+ create mode 100644 src/java/org/apache/cassandra/cql3/LogicalRelation.java
+ create mode 100644 src/java/org/apache/cassandra/cql3/RelationTreeBuilder.java
+ create mode 100644 test/unit/org/apache/cassandra/cql3/SelectStatementTest.java
+
+diff --git a/src/java/org/apache/cassandra/cql3/Cql.g b/src/java/org/apache/cassandra/cql3/Cql.g
+index 8b382fa..8cb4e8a 100644
+--- a/src/java/org/apache/cassandra/cql3/Cql.g
++++ b/src/java/org/apache/cassandra/cql3/Cql.g
+@@ -40,6 +40,7 @@ options {
+     import org.apache.cassandra.auth.DataResource;
+     import org.apache.cassandra.auth.IResource;
+     import org.apache.cassandra.cql3.*;
++    import org.apache.cassandra.cql3.Relation.LogicalOperator;
+     import org.apache.cassandra.cql3.statements.*;
+     import org.apache.cassandra.cql3.functions.FunctionCall;
+     import org.apache.cassandra.db.marshal.CollectionType;
+@@ -47,9 +48,12 @@ options {
+     import org.apache.cassandra.exceptions.InvalidRequestException;
+     import org.apache.cassandra.exceptions.SyntaxException;
+     import org.apache.cassandra.utils.Pair;
++    import org.slf4j.Logger;
++    import org.slf4j.LoggerFactory;
+ }
+ 
+ @members {
++    private static final Logger logger = LoggerFactory.getLogger(CqlParser.class);
+     private final List<String> recognitionErrors = new ArrayList<String>();
+     private final List<ColumnIdentifier> bindVariables = new ArrayList<ColumnIdentifier>();
+ 
+@@ -256,7 +260,7 @@ selectStatement returns [SelectStatement.RawStatement expr]
+     : K_SELECT ( ( K_DISTINCT { isDistinct = true; } )? sclause=selectClause
+                | (K_COUNT '(' sclause=selectCountClause ')' { isCount = true; } (K_AS c=ident { countAlias = c; })?) )
+       K_FROM cf=columnFamilyName
+-      ( K_WHERE wclause=whereClause )?
++      ( K_WHERE wclause=logicalAndOrWhereClause )?
+       ( K_ORDER K_BY orderByClause[orderings] ( ',' orderByClause[orderings] )* )?
+       ( K_LIMIT rows=intValue { limit = rows; } )?
+       ( K_ALLOW K_FILTERING  { allowFiltering = true; } )?
+@@ -299,9 +303,28 @@ selectCountClause returns [List<RawSelector> expr]
+     | i=INTEGER      { if (!i.getText().equals("1")) addRecognitionError("Only COUNT(1) is supported, got COUNT(" + i.getText() + ")"); $expr = Collections.<RawSelector>emptyList();}
+     ;
+ 
+-whereClause returns [List<Relation> clause]
+-    @init{ $clause = new ArrayList<Relation>(); }
+-    : relation[$clause] (K_AND relation[$clause])*
++andOnlyWhereClause returns [List<Relation> clause]
++    @init {
++        $clause = new ArrayList<>();
++    }
++    : relOuter=relation { $clause.addAll(relOuter); } (K_AND relInner=relation { $clause.addAll(relInner); })*
++    ;
++
++logicalAndOrWhereClause returns [List<Relation> clause]
++    @init {
++        RelationTreeBuilder builder = new RelationTreeBuilder();
++    }
++    : logicalExpression[builder] (logicalOp=(K_AND | K_OR) { builder.add(new LogicalRelation(logicalOp.getText())); } logicalExpression[builder])*
++    {
++        $clause = Collections.<Relation>singletonList(builder.build());
++    }
++    ;
++
++logicalExpression[RelationTreeBuilder builder]
++    : r=relation { builder.add(r); }
++    | ('(' { builder.incrementDepth(); })
++           logicalExpression[builder] (logicalOp=(K_AND | K_OR) { builder.add(new LogicalRelation(logicalOp.getText())); } logicalExpression[builder])+
++      (')' { builder.decrementDepth(); })
+     ;
+ 
+ orderByClause[Map<ColumnIdentifier.Raw, Boolean> orderings]
+@@ -366,7 +389,7 @@ updateStatement returns [UpdateStatement.ParsedUpdate expr]
+     : K_UPDATE cf=columnFamilyName
+       ( usingClause[attrs] )?
+       K_SET columnOperation[operations] (',' columnOperation[operations])*
+-      K_WHERE wclause=whereClause
++      K_WHERE wclause=andOnlyWhereClause
+       ( K_IF ( K_EXISTS { ifExists = true; } | conditions=updateConditions ))?
+       {
+           return new UpdateStatement.ParsedUpdate(cf,
+@@ -400,7 +423,7 @@ deleteStatement returns [DeleteStatement.Parsed expr]
+     : K_DELETE ( dels=deleteSelection { columnDeletions = dels; } )?
+       K_FROM cf=columnFamilyName
+       ( usingClauseDelete[attrs] )?
+-      K_WHERE wclause=whereClause
++      K_WHERE wclause=andOnlyWhereClause
+       ( K_IF ( K_EXISTS { ifExists = true; } | conditions=updateConditions ))?
+       {
+           return new DeleteStatement.Parsed(cf,
+@@ -902,44 +925,54 @@ propertyValue returns [String str]
+ 
+ relationType returns [Relation.Type op]
+     : '='  { $op = Relation.Type.EQ; }
++    | '!=' { $op = Relation.Type.NOT_EQ; }
+     | '<'  { $op = Relation.Type.LT; }
+     | '<=' { $op = Relation.Type.LTE; }
+     | '>'  { $op = Relation.Type.GT; }
+     | '>=' { $op = Relation.Type.GTE; }
+     ;
+ 
+-relation[List<Relation> clauses]
+-    : name=cident type=relationType t=term { $clauses.add(new SingleColumnRelation(name, type, t)); }
++relation returns [List<Relation> relations]
++    @init {
++        List<Relation> accumulator = new ArrayList<>();
++    }
++    :
++    (
++    name=cident type=relationType t=term { accumulator.add(new SingleColumnRelation(name, type, t)); }
+     | K_TOKEN l=tupleOfIdentifiers type=relationType t=term
+         {
+-            for (ColumnIdentifier.Raw id : l)
+-                $clauses.add(new SingleColumnRelation(id, type, t, true));
++            for (ColumnIdentifier.Raw id : l) {
++                accumulator.add(new SingleColumnRelation(id, type, t, true));
++            }
+         }
+     | name=cident K_IN marker=inMarker
+-        { $clauses.add(new SingleColumnRelation(name, Relation.Type.IN, marker)); }
++        { accumulator.add(new SingleColumnRelation(name, Relation.Type.IN, marker)); }
+     | name=cident K_IN inValues=singleColumnInValues
+-        { $clauses.add(SingleColumnRelation.createInRelation($name.id, inValues)); }
++        { accumulator.add(SingleColumnRelation.createInRelation($name.id, inValues)); }
+     | ids=tupleOfIdentifiers
+       ( K_IN
+           ( '(' ')'
+-              { $clauses.add(MultiColumnRelation.createInRelation(ids, new ArrayList<Tuples.Literal>())); }
++              { accumulator.add(MultiColumnRelation.createInRelation(ids, new ArrayList<Tuples.Literal>())); }
+           | tupleInMarker=inMarkerForTuple /* (a, b, c) IN ? */
+-              { $clauses.add(MultiColumnRelation.createSingleMarkerInRelation(ids, tupleInMarker)); }
++              { accumulator.add(MultiColumnRelation.createSingleMarkerInRelation(ids, tupleInMarker)); }
+           | literals=tupleOfTupleLiterals /* (a, b, c) IN ((1, 2, 3), (4, 5, 6), ...) */
+               {
+-                  $clauses.add(MultiColumnRelation.createInRelation(ids, literals));
++                  accumulator.add(MultiColumnRelation.createInRelation(ids, literals));
+               }
+           | markers=tupleOfMarkersForTuples /* (a, b, c) IN (?, ?, ...) */
+-              { $clauses.add(MultiColumnRelation.createInRelation(ids, markers)); }
++              { accumulator.add(MultiColumnRelation.createInRelation(ids, markers)); }
+           )
+       | type=relationType literal=tupleLiteral /* (a, b, c) > (1, 2, 3) or (a, b, c) > (?, ?, ?) */
+           {
+-              $clauses.add(MultiColumnRelation.createNonInRelation(ids, type, literal));
++              accumulator.add(MultiColumnRelation.createNonInRelation(ids, type, literal));
+           }
+       | type=relationType tupleMarker=markerForTuple /* (a, b, c) >= ? */
+-          { $clauses.add(MultiColumnRelation.createNonInRelation(ids, type, tupleMarker)); }
++          { accumulator.add(MultiColumnRelation.createNonInRelation(ids, type, tupleMarker)); }
+       )
+-    | '(' relation[$clauses] ')'
++    )
++    {
++        $relations = accumulator;
++    }
+     ;
+ 
+ inMarker returns [AbstractMarker.INRaw marker]
+@@ -1075,6 +1108,7 @@ K_FROM:        F R O M;
+ K_AS:          A S;
+ K_WHERE:       W H E R E;
+ K_AND:         A N D;
++K_OR:          O R;
+ K_KEY:         K E Y;
+ K_INSERT:      I N S E R T;
+ K_UPDATE:      U P D A T E;
+@@ -1169,6 +1203,9 @@ K_INFINITY:    I N F I N I T Y;
+ K_TRIGGER:     T R I G G E R;
+ K_STATIC:      S T A T I C;
+ 
++K_LEFT_PARENTHESIS:  '(';
++K_RIGHT_PARENTHESIS: ')';
++
+ // Case-insensitive alpha characters
+ fragment A: ('a'|'A');
+ fragment B: ('b'|'B');
+diff --git a/src/java/org/apache/cassandra/cql3/LogicalRelation.java b/src/java/org/apache/cassandra/cql3/LogicalRelation.java
+new file mode 100644
+index 0000000..1587939
+--- /dev/null
++++ b/src/java/org/apache/cassandra/cql3/LogicalRelation.java
+@@ -0,0 +1,51 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.cassandra.cql3;
++
++public class LogicalRelation extends Relation
++{
++    public LogicalRelation()
++    {}
++
++    public LogicalRelation(String op)
++    {
++        this(LogicalOperator.valueOf(op.toUpperCase()));
++    }
++
++    public LogicalRelation(LogicalOperator op)
++    {
++        setOp(op);
++    }
++
++    public void setOp(LogicalOperator op)
++    {
++        super.logicalOperator = op;
++    }
++
++    @Override
++    public boolean isLogical()
++    {
++        return true;
++    }
++
++    @Override
++    public boolean isMultiColumn()
++    {
++        return false;
++    }
++}
+diff --git a/src/java/org/apache/cassandra/cql3/Relation.java b/src/java/org/apache/cassandra/cql3/Relation.java
+index e7c5f2d..ecc7925 100644
+--- a/src/java/org/apache/cassandra/cql3/Relation.java
++++ b/src/java/org/apache/cassandra/cql3/Relation.java
+@@ -17,13 +17,16 @@
+  */
+ package org.apache.cassandra.cql3;
+ 
+-public abstract class Relation {
++public abstract class Relation
++{
++    protected LogicalOperator logicalOperator;
++    protected Relation leftRelation, rightRelation;
+ 
+     protected Type relationType;
+ 
+     public static enum Type
+     {
+-        EQ, LT, LTE, GTE, GT, IN;
++        EQ, LT, LTE, GTE, GT, IN, NOT_EQ;
+ 
+         @Override
+         public String toString()
+@@ -42,12 +45,19 @@ public abstract class Relation {
+                     return ">=";
+                 case IN:
+                     return "IN";
++                case NOT_EQ:
++                    return "!=";
+                 default:
+                     return this.name();
+             }
+         }
+     }
+ 
++    public static enum LogicalOperator
++    {
++        OR, AND
++    }
++
+     public Type operator()
+     {
+         return relationType;
+@@ -55,6 +65,41 @@ public abstract class Relation {
+ 
+     public abstract boolean isMultiColumn();
+ 
++    public boolean hasChildren()
++    {
++        return (logicalOperator != null);
++    }
++
++    public Relation getLeftRelation()
++    {
++        return leftRelation;
++    }
++
++    public void setLeftRelation(Relation leftRelation)
++    {
++        this.leftRelation = leftRelation;
++    }
++
++    public Relation getRightRelation()
++    {
++        return rightRelation;
++    }
++
++    public void setRightRelation(Relation rightRelation)
++    {
++        this.rightRelation = rightRelation;
++    }
++
++    public LogicalOperator logicalOperator()
++    {
++        return logicalOperator;
++    }
++
++    public boolean isLogical()
++    {
++        return logicalOperator != null;
++    }
++
+     public boolean isOnToken()
+     {
+         return false;
+diff --git a/src/java/org/apache/cassandra/cql3/RelationTreeBuilder.java b/src/java/org/apache/cassandra/cql3/RelationTreeBuilder.java
+new file mode 100644
+index 0000000..d2dc51b
+--- /dev/null
++++ b/src/java/org/apache/cassandra/cql3/RelationTreeBuilder.java
+@@ -0,0 +1,201 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.cassandra.cql3;
++
++import java.util.List;
++import java.util.Stack;
++
++import org.apache.cassandra.cql3.Relation.LogicalOperator;
++
++import com.google.common.annotations.VisibleForTesting;
++
++/**
++ * This class used used by CQL3 ANTLR grammar to build a relation tree based on the WHERE clause of the select statement,
++ * couple of examples of how those trees are going to look like and steps used to build them are as follows:
++ *
++ * first_name = 'x' AND last_name = 'y' OR age > 5 AND age < 7
++ *                      AND
++ *                     /  \
++ *                    OR   age < 7
++ *                   /  \
++ *                 AND   age > 5
++ *                /   \
++ *    first_name:x     last_name:y
++ *
++ *       # <first_name:x> // add first_name:x
++ *       # <logical-AND left:<first_name:x> right:null> // add logical AND
++ *       # <logical-AND left:<first_name:x> right:<last_name:y>> // add last_name:y
++ *       # <logical-OR  left:<logical-AND left:<first_name:x> right:<last_name:y>> right:null> // add logical OR
++ *       # <logical-OR  left:<logical-AND left:<first_name:x> right:<last_name:y>> right:age ">" 5> // add age > 5
++ *       # <logical-AND left:<logical-OR  left:<logical-AND left:<first_name:x> right:<last_name:y>> right:age ">" 5> right: null> // add logical AND
++ *       # <logical-AND left:<logical-OR  left:<logical-AND left:<first_name:x> right:<last_name:y>> right:age ">" 5> right: age "<" 7> // add age < 7
++ *
++ * first_name = 'x' AND (first_name = 'y' OR last_name = 'z') OR age > 5
++ *                       OR
++ *                      /  \
++ *                   AND    age > 5
++ *                  /   \
++ *      first_name:x     OR
++ *                      /  \
++ *          first_name:y    last_name:z
++ *
++ *       #1 <first_name:x> // add first_name:x
++ *       #2 <logical-AND left:<first_name:x> right:null> // add logical AND
++ *       #3 set depth to 1 // open parenthesis
++ *       #4 <logical-AND left:<first_name:x> right:<first_name:y>> // add first_name:y
++ *       #5 <logical-AND left:<first_name:x> right:<logical-OR left:first_name:y right:null>> // add logical OR
++ *       #6 <logical-AND left:<first_name:x> right:<logical-OR left:first_name:y right:last_name:z>> // add last_name:z
++ *       #7 set depth to 0 // close parenthesis
++ *       #8 <logical-OR left:<logical-AND left:<first_name:x> right:<logical-OR left:first_name:y right:last_name:z>> right: null> // add logical OR
++ *       #9 <logical-OR left:<logical-AND left:<first_name:x> right:<logical-OR left:first_name:y right:last_name:z>> right: age ">" 5> // add age > 5
++ */
++public class RelationTreeBuilder
++{
++    private final Stack<Relation> relationStack = new Stack<>();
++    private Relation root;
++
++    public void add(LogicalRelation logical)
++    {
++        if (relationStack.empty())
++        {
++            logical.setLeftRelation(root);
++            root = logical;
++        }
++        else
++        {
++            Relation current = relationStack.peek();
++            if (current.logicalOperator == null)
++            {
++                current.logicalOperator = logical.logicalOperator;
++            }
++            else
++            {
++
++                logical.setLeftRelation(current.getRightRelation());
++                current.setRightRelation(logical);
++                relationStack.push(logical);
++            }
++        }
++    }
++
++    public void add(List<Relation> relation)
++    {
++        if (root == null)
++        {
++            root = flatten(relation);
++            return;
++        }
++
++        addColumnRelation(flatten(relation));
++    }
++
++    public void incrementDepth()
++    {
++        Relation groupOp = new LogicalRelation();
++
++        if (root == null)
++        {
++            root = groupOp;
++        }
++        else if (relationStack.empty())
++        {
++            root.setRightRelation(groupOp);
++        }
++        else
++        {
++            Relation current = relationStack.peek();
++            if (current.getLeftRelation() == null)
++                current.setLeftRelation(groupOp);
++            else
++                current.setRightRelation(groupOp);
++        }
++
++        relationStack.push(groupOp);
++    }
++
++    public void decrementDepth()
++    {
++        while (!relationStack.empty())
++        {
++            Relation current = relationStack.peek();
++            if (current.logicalOperator == null)
++                break;
++
++            relationStack.pop();
++        }
++    }
++
++    public Relation build()
++    {
++        return root;
++    }
++
++    private void addColumnRelation(Relation column)
++    {
++        if (relationStack.empty())
++        {
++            root.setRightRelation(column);
++            return;
++        }
++
++        Relation current = relationStack.peek();
++        if (current.getLeftRelation() == null)
++            current.setLeftRelation(column);
++        else if (current.getRightRelation() == null)
++            current.setRightRelation(column);
++    }
++
++    /**
++     * Flattens list of the relations into a tree using AND logical relations.
++     * e.g.  [1, 2, 3] is going to become:
++     *          AND
++     *         /   \
++     *       AND    3
++     *      /   \
++     *     1     2
++     * @param relations The list of relations to fallen.
++     *
++     * @return if list only has a single element only that element is going to be returned,
++     *         otherwise flattened tree would be returned.
++     */
++    @VisibleForTesting
++    protected static Relation flatten(List<Relation> relations)
++    {
++        if (relations.size() == 1)
++            return relations.get(0);
++
++        Relation root = new LogicalRelation(LogicalOperator.AND);
++        for (Relation relation : relations)
++        {
++            if (root.getLeftRelation() == null)
++            {
++                root.setLeftRelation(relation);
++            }
++            else
++            {
++                root.setRightRelation(relation);
++                Relation newRoot = new LogicalRelation(LogicalOperator.AND);
++
++                newRoot.setLeftRelation(root);
++                root = newRoot;
++            }
++        }
++
++        return root;
++    }
++}
+diff --git a/src/java/org/apache/cassandra/cql3/SingleColumnRelation.java b/src/java/org/apache/cassandra/cql3/SingleColumnRelation.java
+index 388d938..7451173 100644
+--- a/src/java/org/apache/cassandra/cql3/SingleColumnRelation.java
++++ b/src/java/org/apache/cassandra/cql3/SingleColumnRelation.java
+@@ -106,7 +106,7 @@ public class SingleColumnRelation extends Relation
+             return String.format("%s IN %s", entity, inValues);
+         else if (onToken)
+             return String.format("token(%s) %s %s", entity, relationType, value);
+-        else
+-            return String.format("%s %s %s", entity, relationType, value);
++
++        return String.format("%s %s %s", entity, relationType, value);
+     }
+ }
+diff --git a/src/java/org/apache/cassandra/cql3/statements/Restriction.java b/src/java/org/apache/cassandra/cql3/statements/Restriction.java
+index f582c84..ca2b49e 100644
+--- a/src/java/org/apache/cassandra/cql3/statements/Restriction.java
++++ b/src/java/org/apache/cassandra/cql3/statements/Restriction.java
+@@ -34,6 +34,7 @@ public interface Restriction
+ 
+     public boolean isSlice();
+     public boolean isEQ();
++    public boolean isNotEQ();
+     public boolean isIN();
+     public boolean isMultiColumn();
+ 
+diff --git a/src/java/org/apache/cassandra/cql3/statements/SelectStatement.java b/src/java/org/apache/cassandra/cql3/statements/SelectStatement.java
+index a9eae7a..40fdda9 100644
+--- a/src/java/org/apache/cassandra/cql3/statements/SelectStatement.java
++++ b/src/java/org/apache/cassandra/cql3/statements/SelectStatement.java
+@@ -27,6 +27,7 @@ import com.google.common.base.Predicate;
+ import com.google.common.collect.Iterables;
+ import com.google.common.collect.Iterators;
+ 
++import org.apache.cassandra.thrift.LogicalIndexOperator;
+ import org.github.jamm.MemoryMeter;
+ 
+ import org.apache.cassandra.auth.Permission;
+@@ -91,6 +92,8 @@ public class SelectStatement implements CQLStatement, MeasurableForPreparedCache
+     private final Map<CFDefinition.Name, Boolean> restrictedNames = new HashMap<CFDefinition.Name, Boolean>();
+     private Restriction.Slice sliceRestriction;
+ 
++    private Stack<Relation> whereClause;
++
+     private boolean isReversed;
+     private boolean onToken;
+     private boolean isKeyRange;
+@@ -102,6 +105,8 @@ public class SelectStatement implements CQLStatement, MeasurableForPreparedCache
+     private boolean selectsStaticColumns;
+     private boolean selectsOnlyStaticColumns;
+ 
++    private VariableSpecifications boundVariables;
++
+     // Used by forSelection below
+     private static final Parameters defaultParameters = new Parameters(Collections.<ColumnIdentifier.Raw, Boolean>emptyMap(), false, false, null, false);
+ 
+@@ -115,6 +120,11 @@ public class SelectStatement implements CQLStatement, MeasurableForPreparedCache
+ 
+     public SelectStatement(CFMetaData cfm, int boundTerms, Parameters parameters, Selection selection, Term limit)
+     {
++        this(cfm, boundTerms, parameters, selection, limit, null);
++    }
++
++    public SelectStatement(CFMetaData cfm, int boundTerms, Parameters parameters, Selection selection, Term limit, VariableSpecifications boundVariables)
++    {
+         this.cfm = cfm;
+         this.boundTerms = boundTerms;
+         this.selection = selection;
+@@ -122,6 +132,7 @@ public class SelectStatement implements CQLStatement, MeasurableForPreparedCache
+         this.columnRestrictions = new Restriction[cfm.clusteringKeyColumns().size()];
+         this.parameters = parameters;
+         this.limit = limit;
++        this.boundVariables = boundVariables;
+ 
+         // Now gather a few info on whether we should bother with static columns or not for this statement
+         initStaticColumnsInfo();
+@@ -1088,67 +1099,118 @@ public class SelectStatement implements CQLStatement, MeasurableForPreparedCache
+         if (!usesSecondaryIndexing || restrictedNames.isEmpty())
+             return Collections.emptyList();
+ 
+-        List<IndexExpression> expressions = new ArrayList<IndexExpression>();
+-        for (CFDefinition.Name name : restrictedNames.keySet())
++        List<IndexExpression> expressions = new ArrayList<>();
++
++        Set<CFDefinition.Name> keyRestrictionsAdded = new HashSet<>();
++        Set<CFDefinition.Name> columnRestrictionsAdded = new HashSet<>();
++
++        ListIterator<Relation> whereIterator = whereClause.listIterator(whereClause.size());
++
++        outer:
++        while (whereIterator.hasPrevious())
+         {
+-            Restriction restriction;
+-            switch (name.kind)
++            Relation relation = whereIterator.previous();
++
++            // CQL3 achieves expanded faux 2i with clustering columns and overloads
++            // queries as 2i indexed if the query can be satisfied based on clustering
++            // columns. This makes like difficult for actual 2i implementations such as SASI
++            // that expect logical operator index expressions for proper OR/AND grouping.
++            // For now, only add the logical operator IndexExpression for all queries that
++            // do not use clustering columns. This means SASI and clustering columns is
++            // not supported at this time. :\
++            if (relation.hasChildren() && hasNoClusteringColumnsRestriction())
+             {
+-                case KEY_ALIAS:
+-                    restriction = keyRestrictions[name.position];
+-                    break;
+-                case COLUMN_ALIAS:
+-                    restriction = columnRestrictions[name.position];
+-                    break;
+-                case COLUMN_METADATA:
+-                case STATIC:
+-                    restriction = metadataRestrictions.get(name);
+-                    break;
+-                default:
+-                    // We don't allow restricting a VALUE_ALIAS for now in prepare.
+-                    throw new AssertionError();
++                IndexExpression logicalOpIE = new IndexExpression(ByteBufferUtil.EMPTY_BYTE_BUFFER,
++                                                                  IndexOperator.EQ,
++                                                                  ByteBufferUtil.EMPTY_BYTE_BUFFER);
++                logicalOpIE.setLogicalOp(LogicalIndexOperator.valueOf(relation.logicalOperator().name()));
++                expressions.add(logicalOpIE);
++                continue;
+             }
+ 
+-            if (restriction.isSlice())
++            List<CFDefinition.Name> names = new ArrayList<>();
++            if (relation instanceof SingleColumnRelation)
+             {
+-                Restriction.Slice slice = (Restriction.Slice)restriction;
+-                for (Bound b : Bound.values())
+-                {
+-                    if (slice.hasBound(b))
+-                    {
+-                        ByteBuffer value = slice.bound(b, variables);
+-                        validateIndexExpressionValue(value, name);
+-                        IndexOperator op = slice.getIndexOperator(b);
+-                        // If the underlying comparator for name is reversed, we need to reverse the IndexOperator: user operation
+-                        // always refer to the "forward" sorting even if the clustering order is reversed, but the 2ndary code does
+-                        // use the underlying comparator as is.
+-                        if (name.type instanceof ReversedType)
+-                            op = reverse(op);
+-                        expressions.add(new IndexExpression(name.name.key, op, value));
+-                    }
+-                }
++                SingleColumnRelation columnRelation = (SingleColumnRelation) relation;
++                names.add(cfm.getCfDef().get(columnRelation.getEntity().prepare(cfm)));
+             }
+-            else
++            else if (relation instanceof MultiColumnRelation)
++            {
++                names.addAll(restrictedNames.keySet());
++            }
++
++            for (CFDefinition.Name name : names)
+             {
+-                ByteBuffer value;
+-                if (restriction.isMultiColumn())
++                Restriction restriction;
++                switch (name.kind)
+                 {
+-                    List<ByteBuffer> values = restriction.values(variables);
+-                    value = values.get(name.position);
++                    case KEY_ALIAS:
++                        if (keyRestrictionsAdded.contains(name))
++                            continue outer;
++                        restriction = keyRestrictions[name.position];
++                        keyRestrictionsAdded.add(name);
++                        break;
++                    case COLUMN_ALIAS:
++                        if (columnRestrictionsAdded.contains(name))
++                            continue outer;
++                        restriction = columnRestrictions[name.position];
++                        columnRestrictionsAdded.add(name);
++                        break;
++                    case COLUMN_METADATA:
++                    case STATIC:
++                        if (relation instanceof SingleColumnRelation && !relation.isOnToken())
++                            restriction = RawStatement.updateSingleColumnRestriction(name,
++                                    null, null, (SingleColumnRelation) relation, boundVariables);
++                        else
++                            restriction = metadataRestrictions.get(name);
++                        break;
++                    default:
++                        // We don't allow restricting a VALUE_ALIAS for now in prepare.
++                        throw new AssertionError();
++                }
++
++                if (restriction.isSlice())
++                {
++                    Restriction.Slice slice = (Restriction.Slice) restriction;
++                    for (Bound b : Bound.values())
++                    {
++                        if (slice.hasBound(b))
++                        {
++                            ByteBuffer value = slice.bound(b, variables);
++                            validateIndexExpressionValue(value, name);
++                            IndexOperator op = slice.getIndexOperator(b);
++                            // If the underlying comparator for name is reversed, we need to reverse the IndexOperator: user operation
++                            // always refer to the "forward" sorting even if the clustering order is reversed, but the 2ndary code does
++                            // use the underlying comparator as is.
++                            if (name.type instanceof ReversedType)
++                                op = reverse(op);
++                            expressions.add(new IndexExpression(name.name.key, op, value));
++                        }
++                    }
+                 }
+                 else
+                 {
+-                    List<ByteBuffer> values = restriction.values(variables);
+-                    if (values.size() != 1)
+-                        throw new InvalidRequestException("IN restrictions are not supported on indexed columns");
++                    ByteBuffer value;
++                    if (restriction.isMultiColumn())
++                    {
++                        List<ByteBuffer> values = restriction.values(variables);
++                        value = values.get(name.position);
++                    }
++                    else
++                    {
++                        List<ByteBuffer> values = restriction.values(variables);
++                        if (values.size() != 1)
++                            throw new InvalidRequestException("IN restrictions are not supported on indexed columns");
+ 
+-                    value = values.get(0);
+-                }
++                        value = values.get(0);
++                    }
+ 
+-                validateIndexExpressionValue(value, name);
+-                expressions.add(new IndexExpression(name.name.key, IndexOperator.EQ, value));
++                    validateIndexExpressionValue(value, name);
++                    expressions.add(new IndexExpression(name.name.key, restriction.isEQ() ? IndexOperator.EQ : IndexOperator.NOT_EQ, value));
++                }
+             }
+         }
++
+         return expressions;
+     }
+ 
+@@ -1539,7 +1601,7 @@ public class SelectStatement implements CQLStatement, MeasurableForPreparedCache
+                                 ? Selection.wildcard(cfDef, parameters.isCount, parameters.countAlias)
+                                 : Selection.fromSelectors(cfDef, selectClause);
+ 
+-            SelectStatement stmt = new SelectStatement(cfm, boundNames.size(), parameters, selection, prepareLimit(boundNames));
++            SelectStatement stmt = new SelectStatement(cfm, boundNames.size(), parameters, selection, prepareLimit(boundNames), boundNames);
+ 
+             /*
+              * WHERE clause. For a given entity, rules are:
+@@ -1551,8 +1613,20 @@ public class SelectStatement implements CQLStatement, MeasurableForPreparedCache
+              */
+             boolean hasQueriableIndex = false;
+             boolean hasQueriableClusteringColumnIndex = false;
+-            for (Relation relation : whereClause)
++
++            Stack<Relation> localFlattenedWhereRelations = null;
++            if (whereClause.size() > 0)
+             {
++                stmt.whereClause = flattenPreOrder(whereClause.get(0));
++                localFlattenedWhereRelations = (Stack<Relation>) stmt.whereClause.clone();
++            }
++
++            while (localFlattenedWhereRelations != null && !localFlattenedWhereRelations.empty()) {
++                Relation relation = localFlattenedWhereRelations.pop();
++
++                if (relation.hasChildren())
++                    continue;
++
+                 if (relation.isMultiColumn())
+                 {
+                     MultiColumnRelation rel = (MultiColumnRelation) relation;
+@@ -1632,6 +1706,34 @@ public class SelectStatement implements CQLStatement, MeasurableForPreparedCache
+             return new ParsedStatement.Prepared(stmt, boundNames);
+         }
+ 
++        /**
++         * Flattens the query tree built from the grammar using
++         * pre order traversal so we can pass the tree without major
++         * backwards breaking and incompatible API changes.
++         */
++        private Stack<Relation> flattenPreOrder(Relation startingRoot)
++        {
++            Stack<Relation> flattened = new Stack<>();
++            Stack<Relation> parentStack = new Stack<>();
++
++            Relation current = startingRoot;
++            while (!parentStack.isEmpty() || current != null)
++            {
++                if (current != null)
++                {
++                    flattened.push(current);
++                    if (current.getRightRelation() != null)
++                        parentStack.push(current.getRightRelation());
++                    current = current.getLeftRelation();
++                }
++                else
++                {
++                    current = parentStack.pop();
++                }
++            }
++            return flattened;
++        }
++
+         /** Returns a pair of (hasQueriableIndex, hasQueriableClusteringColumnIndex) */
+         private boolean[] processRelationEntity(SelectStatement stmt, Relation relation, ColumnIdentifier entity, CFDefinition cfDef) throws InvalidRequestException
+         {
+@@ -1869,7 +1971,8 @@ public class SelectStatement implements CQLStatement, MeasurableForPreparedCache
+                 case COLUMN_METADATA:
+                 case STATIC:
+                     // We only all IN on the row key and last clustering key so far, never on non-PK columns, and this even if there's an index
+-                    Restriction r = updateSingleColumnRestriction(name, stmt.metadataRestrictions.get(name), null, relation, names);
++                    Restriction existing = (relation.isOnToken()) ? getExistingRestriction(stmt, name) : null;
++                    Restriction r = updateSingleColumnRestriction(name, existing, null, relation, names);
+                     if (r.isIN() && !((Restriction.IN)r).canHaveOnlyOneValue())
+                         // Note: for backward compatibility reason, we conside a IN of 1 value the same as a EQ, so we let that slide.
+                         throw new InvalidRequestException(String.format("IN predicates on non-primary-key columns (%s) is not yet supported", name));
+@@ -1878,7 +1981,7 @@ public class SelectStatement implements CQLStatement, MeasurableForPreparedCache
+             }
+         }
+ 
+-        Restriction updateSingleColumnRestriction(CFDefinition.Name name, Restriction existingRestriction, Restriction previousRestriction, SingleColumnRelation newRel, VariableSpecifications boundNames) throws InvalidRequestException
++        public static Restriction updateSingleColumnRestriction(CFDefinition.Name name, Restriction existingRestriction, Restriction previousRestriction, SingleColumnRelation newRel, VariableSpecifications boundNames) throws InvalidRequestException
+         {
+             ColumnSpecification receiver = name;
+             if (newRel.onToken)
+@@ -1901,6 +2004,16 @@ public class SelectStatement implements CQLStatement, MeasurableForPreparedCache
+ 
+             switch (newRel.operator())
+             {
++                case NOT_EQ:
++                {
++                    if (existingRestriction != null)
++                        throw new InvalidRequestException(String.format("%s cannot be restricted by more than one relation if it includes an Equal", name));
++                    Term t = newRel.getValue().prepare(receiver);
++                    t.collectMarkerSpecification(boundNames);
++                    existingRestriction = new SingleColumnRestriction.NOT_EQ(t, newRel.onToken);
++                }
++                break;
++
+                 case EQ:
+                 {
+                     if (existingRestriction != null)
+@@ -2061,14 +2174,37 @@ public class SelectStatement implements CQLStatement, MeasurableForPreparedCache
+             Iterator<Name> iter = Iterators.cycle(cfDef.partitionKeys());
+             for (Relation relation : whereClause)
+             {
+-                if (!relation.isOnToken())
+-                    continue;
++                Relation current = relation;
++                Stack<Relation> relations = new Stack<>();
++
++                while (!relations.isEmpty() || current != null)
++                {
++                    if (current != null)
++                    {
++                        relations.push(current);
++                        current = current.getLeftRelation();
++                    }
++                    else
++                    {
++                        current = relations.pop();
+ 
+-                assert !relation.isMultiColumn() : "Unexpectedly got multi-column token relation";
+-                SingleColumnRelation singleColumnRelation = (SingleColumnRelation) relation;
+-                if (!cfDef.get(singleColumnRelation.getEntity().prepare(cfDef.cfm)).equals(iter.next()))
+-                    throw new InvalidRequestException(String.format("The token function arguments must be in the partition key order: %s",
+-                                                                    Joiner.on(',').join(cfDef.partitionKeys())));
++                        if (!current.isLogical())
++                        {
++                            if (!current.isOnToken())
++                            {
++                                current = current.getRightRelation();
++                                continue;
++                            }
++
++                            SingleColumnRelation singleColumnRelation = (SingleColumnRelation) current;
++                            if (!cfDef.get(singleColumnRelation.getEntity().prepare(cfDef.cfm)).equals(iter.next()))
++                                throw new InvalidRequestException(String.format("The token function arguments must be in the partition key order: %s",
++                                                                                Joiner.on(',').join(cfDef.partitionKeys())));
++                        }
++
++                        current = current.getRightRelation();
++                    }
++                }
+             }
+         }
+ 
+diff --git a/src/java/org/apache/cassandra/cql3/statements/SingleColumnRestriction.java b/src/java/org/apache/cassandra/cql3/statements/SingleColumnRestriction.java
+index e326597..bc365ff 100644
+--- a/src/java/org/apache/cassandra/cql3/statements/SingleColumnRestriction.java
++++ b/src/java/org/apache/cassandra/cql3/statements/SingleColumnRestriction.java
+@@ -33,6 +33,24 @@ public abstract class SingleColumnRestriction implements Restriction
+         return false;
+     }
+ 
++    public static class NOT_EQ extends EQ
++    {
++        public NOT_EQ(Term value, boolean onToken)
++        {
++            super(value, onToken);
++        }
++
++        public boolean isEQ()
++        {
++            return false;
++        }
++
++        public boolean isNotEQ()
++        {
++            return true;
++        }
++    }
++
+     public static class EQ extends SingleColumnRestriction implements Restriction.EQ
+     {
+         protected final Term value;
+@@ -59,6 +77,11 @@ public abstract class SingleColumnRestriction implements Restriction
+             return true;
+         }
+ 
++        public boolean isNotEQ()
++        {
++            return false;
++        }
++
+         public boolean isIN()
+         {
+             return false;
+@@ -108,6 +131,11 @@ public abstract class SingleColumnRestriction implements Restriction
+             return false;
+         }
+ 
++        public boolean isNotEQ()
++        {
++            return false;
++        }
++
+         public boolean isIN()
+         {
+             return true;
+@@ -162,6 +190,11 @@ public abstract class SingleColumnRestriction implements Restriction
+             return true;
+         }
+ 
++        public boolean isNotEQ()
++        {
++            return false;
++        }
++
+         public boolean isOnToken()
+         {
+             return false;
+@@ -197,6 +230,11 @@ public abstract class SingleColumnRestriction implements Restriction
+             return false;
+         }
+ 
++        public boolean isNotEQ()
++        {
++            return false;
++        }
++
+         public boolean isIN()
+         {
+             return false;
+diff --git a/test/unit/org/apache/cassandra/cql3/SelectStatementTest.java b/test/unit/org/apache/cassandra/cql3/SelectStatementTest.java
+new file mode 100644
+index 0000000..038ca03
+--- /dev/null
++++ b/test/unit/org/apache/cassandra/cql3/SelectStatementTest.java
+@@ -0,0 +1,160 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.cassandra.cql3;
++
++import junit.framework.Assert;
++import org.apache.cassandra.SchemaLoader;
++import org.apache.cassandra.cql3.statements.ParsedStatement;
++import org.apache.cassandra.cql3.statements.SelectStatement;
++import org.apache.cassandra.db.ConsistencyLevel;
++import org.apache.cassandra.db.marshal.Int32Type;
++import org.apache.cassandra.db.marshal.UTF8Type;
++import org.apache.cassandra.thrift.IndexExpression;
++import org.apache.cassandra.thrift.IndexOperator;
++import org.apache.cassandra.thrift.LogicalIndexOperator;
++import org.apache.cassandra.utils.ByteBufferUtil;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++import java.nio.ByteBuffer;
++import java.util.*;
++
++import static org.apache.cassandra.cql3.QueryProcessor.process;
++
++public class SelectStatementTest
++{
++    static String keyspace = "select_statement_test";
++
++    @BeforeClass
++    public static void setUpClass() throws Throwable
++    {
++        System.setProperty("cassandra.config", "cassandra-murmur.yaml");
++        SchemaLoader.loadSchema(false);
++        executeSchemaChange("CREATE KEYSPACE IF NOT EXISTS %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}");
++        executeSchemaChange("CREATE TABLE %s.test (ts timeuuid, foo text, bar text, first_name text, last_name text, street text, city text, " +
++                "state text, country text, num1 int, v1 int, v2 int, v3 int, primary key (ts)) " +
++                "WITH COMPACT STORAGE AND compaction = { 'class' : 'LeveledCompactionStrategy' };");
++        executeSchemaChange("CREATE CUSTOM INDEX ON %s.test (foo) using 'org.apache.cassandra.db.index.SSTableAttachedSecondaryIndex';");
++        executeSchemaChange("CREATE CUSTOM INDEX ON %s.test (bar) using 'org.apache.cassandra.db.index.SSTableAttachedSecondaryIndex';");
++        executeSchemaChange("CREATE CUSTOM INDEX ON %s.test (first_name) using 'org.apache.cassandra.db.index.SSTableAttachedSecondaryIndex';");
++        executeSchemaChange("CREATE CUSTOM INDEX ON %s.test (last_name) using 'org.apache.cassandra.db.index.SSTableAttachedSecondaryIndex';");
++        executeSchemaChange("CREATE CUSTOM INDEX ON %s.test (street) using 'org.apache.cassandra.db.index.SSTableAttachedSecondaryIndex';");
++        executeSchemaChange("CREATE CUSTOM INDEX ON %s.test (city) using 'org.apache.cassandra.db.index.SSTableAttachedSecondaryIndex';");
++        executeSchemaChange("CREATE CUSTOM INDEX ON %s.test (state) using 'org.apache.cassandra.db.index.SSTableAttachedSecondaryIndex';");
++        executeSchemaChange("CREATE CUSTOM INDEX ON %s.test (country) using 'org.apache.cassandra.db.index.SSTableAttachedSecondaryIndex';");
++        executeSchemaChange("CREATE CUSTOM INDEX ON %s.test (num1) using 'org.apache.cassandra.db.index.SSTableAttachedSecondaryIndex';");
++
++        executeSchemaChange("CREATE TABLE %s.test2 (k int, v1 int, v2 int, v3 int, PRIMARY KEY (k, v1, v2, v3)) " +
++                "WITH COMPACT STORAGE AND compaction = { 'class' : 'LeveledCompactionStrategy' };");
++    }
++
++    private static void executeSchemaChange(String query) throws Throwable
++    {
++        try
++        {
++            process(String.format(query, keyspace), ConsistencyLevel.ONE);
++        } catch (RuntimeException exc)
++        {
++            throw exc.getCause();
++        }
++    }
++
++    @Test
++    public void parseSimpleORSelectStatementTest() throws Exception
++    {
++        QueryProcessor.parseStatement("SELECT * FROM test WHERE foo = 'abcd' OR bar = 'xyz';");
++    }
++
++    @Test
++    public void parseSimpleANDSelectStatementTest() throws Exception
++    {
++        QueryProcessor.parseStatement("SELECT * FROM test WHERE foo = 'abcd' AND bar = 'xyz';");
++    }
++
++    @Test
++    public void parseNestedORWithANDSelectStatementTest() throws Exception
++    {
++        ParsedStatement parsedStatement = QueryProcessor.parseStatement(String.format(
++                "SELECT * FROM %s.test WHERE foo = 'abcd' AND (bar = 'xyz' OR bar = 'qwerty') ALLOW FILTERING;", keyspace));
++        parsedStatement.prepare();
++    }
++
++    @Test
++    public void parseComplexMultipleNestedORAndANDSelectTest() throws Exception
++    {
++        String whereClause = "first_name='Bob' AND ( last_name='Smith' OR num1=25 AND " +
++                "street='Infinite_Loop' AND city='Cupertino' ) OR ( foo='this_is_foos_val' " +
++                "AND bar='this_is_bars_val' ) OR ( state='CA' AND country='US' ) ";
++        ParsedStatement parsedStatement = QueryProcessor.parseStatement("SELECT * FROM "+keyspace+".test " +
++                "WHERE " + whereClause + " ALLOW FILTERING;");
++        SelectStatement selectStatement = (SelectStatement) parsedStatement.prepare().statement;
++
++        List<IndexExpression> indexExpressions = selectStatement.getIndexExpressions(Collections.<ByteBuffer>emptyList());
++        Assert.assertEquals(17, indexExpressions.size());
++
++        List<IndexExpression> expected = new ArrayList<IndexExpression>()
++        {{
++            add(new IndexExpression().setOp(IndexOperator.EQ).setColumn_name("country".getBytes()).setValue("US".getBytes()));
++            add(new IndexExpression().setOp(IndexOperator.EQ).setColumn_name("state".getBytes()).setValue("CA".getBytes()));
++            add(makeLogical(LogicalIndexOperator.AND));
++
++            add(new IndexExpression().setOp(IndexOperator.EQ).setColumn_name("bar".getBytes()).setValue("this_is_bars_val".getBytes()));
++            add(new IndexExpression().setOp(IndexOperator.EQ).setColumn_name("foo".getBytes()).setValue("this_is_foos_val".getBytes()));
++            add(makeLogical(LogicalIndexOperator.AND));
++
++            add(new IndexExpression().setOp(IndexOperator.EQ).setColumn_name("city".getBytes()).setValue("Cupertino".getBytes()));
++            add(new IndexExpression().setOp(IndexOperator.EQ).setColumn_name("street".getBytes()).setValue("Infinite_Loop".getBytes()));
++            add(makeLogical(LogicalIndexOperator.AND));
++
++            add(new IndexExpression().setOp(IndexOperator.EQ).setColumn_name("num1".getBytes()).setValue(Int32Type.instance.decompose(25)));
++            add(makeLogical(LogicalIndexOperator.AND));
++
++            add(new IndexExpression().setOp(IndexOperator.EQ).setColumn_name("last_name".getBytes()).setValue("Smith".getBytes()));
++            add(makeLogical(LogicalIndexOperator.OR));
++
++            add(new IndexExpression().setOp(IndexOperator.EQ).setColumn_name("first_name".getBytes()).setValue("Bob".getBytes()));
++            add(makeLogical(LogicalIndexOperator.AND));
++
++            add(makeLogical(LogicalIndexOperator.OR));
++            add(makeLogical(LogicalIndexOperator.OR));
++        }};
++
++        Assert.assertEquals(expected, indexExpressions);
++    }
++
++    @Test
++    public void parseTupleNotationTest() throws Exception
++    {
++        ParsedStatement parsedStatement = QueryProcessor.parseStatement("SELECT v1, v2, v3 FROM "+keyspace+".test2 " +
++                "WHERE k = 0 AND (v1, v2, v3) >= (1, 0, 1)");
++        parsedStatement.prepare();
++    }
++
++    private static IndexExpression makeLogical(LogicalIndexOperator op)
++    {
++        IndexExpression e = new IndexExpression();
++
++        e.setLogicalOp(op);
++        e.setOp(IndexOperator.EQ);
++
++        e.setColumn_name(ByteBufferUtil.EMPTY_BYTE_BUFFER);
++        e.setValue(ByteBufferUtil.EMPTY_BYTE_BUFFER);
++
++        return e;
++    }
++}
+diff --git a/test/unit/org/apache/cassandra/cql3/SingleColumnRelationTest.java b/test/unit/org/apache/cassandra/cql3/SingleColumnRelationTest.java
+index 8ce4a36..62e8fd7 100644
+--- a/test/unit/org/apache/cassandra/cql3/SingleColumnRelationTest.java
++++ b/test/unit/org/apache/cassandra/cql3/SingleColumnRelationTest.java
+@@ -153,9 +153,9 @@ public class SingleColumnRelationTest
+                              "SELECT * FROM %s.compound_partition WHERE a >= 1 and (a, b) < (4, 1)");
+         assertInvalidMessage("Multi-column relations can only be applied to clustering columns: a",
+                              "SELECT * FROM %s.compound_partition WHERE b >= 1 and (a, b) < (4, 1)");
+-        assertInvalidMessage("Multi-column relations can only be applied to clustering columns: a",
+-                             "SELECT * FROM %s.compound_partition WHERE (a, b) >= (1, 1) and (b) < (4)");
+         assertInvalidMessage("Multi-column relations can only be applied to clustering columns: b",
++                             "SELECT * FROM %s.compound_partition WHERE (a, b) >= (1, 1) and (b) < (4)");
++        assertInvalidMessage("Multi-column relations can only be applied to clustering columns: a",
+                              "SELECT * FROM %s.compound_partition WHERE (b) < (4) and (a, b) >= (1, 1)");
+         assertInvalidMessage("Multi-column relations can only be applied to clustering columns: a",
+                              "SELECT * FROM %s.compound_partition WHERE (a, b) >= (1, 1) and a = 1");
+diff --git a/test/unit/org/apache/cassandra/cql3/statements/SelectStatementTest.java b/test/unit/org/apache/cassandra/cql3/statements/SelectStatementTest.java
+index 1a66002..051e30e 100644
+--- a/test/unit/org/apache/cassandra/cql3/statements/SelectStatementTest.java
++++ b/test/unit/org/apache/cassandra/cql3/statements/SelectStatementTest.java
+@@ -22,10 +22,12 @@ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.List;
+ 
++import org.junit.Before;
+ import org.junit.Test;
+ 
+ import org.apache.cassandra.config.CFMetaData;
+ import org.apache.cassandra.config.ColumnDefinition;
++import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.cql3.*;
+ import org.apache.cassandra.cql3.CFDefinition.Name;
+ import org.apache.cassandra.db.ColumnFamilyType;
+@@ -43,6 +45,17 @@ import static org.junit.Assert.assertEquals;
+ 
+ public class SelectStatementTest
+ {
++    /**
++     * This is required as each of the test methods on this class create a new CFFMetaData instance before DD/KSMD
++     * is init'd ... and all hell breaks loose with that difference in initialization
++     */
++    @Before
++    public void setup()
++    {
++        // just call anything on DD to get it (and KSMD/CFMD) to init
++        DatabaseDescriptor.getBroadcastAddress();
++    }
++
+     @Test
+     public void testBuildBoundWithNoRestrictions() throws Exception
+     {
+-- 
+2.6.0
+

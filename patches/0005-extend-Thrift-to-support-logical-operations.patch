@@ -1,0 +1,341 @@
+From a83770eb93db032e9f6252111ff8be6170f77c6a Mon Sep 17 00:00:00 2001
+From: Pavel Yaskevich <xedin@apache.org>
+Date: Mon, 2 Nov 2015 16:56:35 -0800
+Subject: [PATCH 05/10] extend Thrift to support logical operations
+
+---
+ interface/cassandra.thrift                         |  11 +-
+ .../org/apache/cassandra/db/RangeSliceCommand.java |  11 +-
+ .../apache/cassandra/db/filter/ExtendedFilter.java |   6 +-
+ .../apache/cassandra/thrift/ThriftValidation.java  |   4 +
+ test/unit/org/apache/cassandra/SchemaLoader.java   | 162 +++++++++++++++++++++
+ 5 files changed, 190 insertions(+), 4 deletions(-)
+
+diff --git a/interface/cassandra.thrift b/interface/cassandra.thrift
+index e469416..263db4d 100644
+--- a/interface/cassandra.thrift
++++ b/interface/cassandra.thrift
+@@ -55,7 +55,7 @@ namespace rb CassandraThrift
+ # An effort should be made not to break forward-client-compatibility either
+ # (e.g. one should avoid removing obsolete fields from the IDL), but no
+ # guarantees in this respect are made by the Cassandra project.
+-const string VERSION = "19.38.0"
++const string VERSION = "19.39.0"
+ 
+ 
+ #
+@@ -313,13 +313,20 @@ enum IndexOperator {
+     GTE,
+     GT,
+     LTE,
+-    LT
++    LT,
++    NOT_EQ
++}
++
++enum LogicalIndexOperator {
++    OR,
++    AND
+ }
+ 
+ struct IndexExpression {
+     1: required binary column_name,
+     2: required IndexOperator op,
+     3: required binary value,
++    4: optional LogicalIndexOperator logicalOp,
+ }
+ 
+ /**
+diff --git a/src/java/org/apache/cassandra/db/RangeSliceCommand.java b/src/java/org/apache/cassandra/db/RangeSliceCommand.java
+index fdf3ccc..029aad8 100644
+--- a/src/java/org/apache/cassandra/db/RangeSliceCommand.java
++++ b/src/java/org/apache/cassandra/db/RangeSliceCommand.java
+@@ -26,7 +26,6 @@ import java.util.List;
+ 
+ import org.apache.cassandra.config.CFMetaData;
+ import org.apache.cassandra.config.Schema;
+-import org.apache.cassandra.db.Keyspace;
+ import org.apache.cassandra.db.filter.ExtendedFilter;
+ import org.apache.cassandra.db.filter.IDiskAtomFilter;
+ import org.apache.cassandra.db.marshal.AbstractType;
+@@ -38,6 +37,7 @@ import org.apache.cassandra.net.MessagingService;
+ import org.apache.cassandra.service.pager.Pageable;
+ import org.apache.cassandra.thrift.IndexExpression;
+ import org.apache.cassandra.thrift.IndexOperator;
++import org.apache.cassandra.thrift.LogicalIndexOperator;
+ import org.apache.cassandra.utils.ByteBufferUtil;
+ 
+ public class RangeSliceCommand extends AbstractRangeCommand implements Pageable
+@@ -197,6 +197,10 @@ class RangeSliceCommandSerializer implements IVersionedSerializer<RangeSliceComm
+                 ByteBufferUtil.writeWithShortLength(expr.column_name, out);
+                 out.writeInt(expr.op.getValue());
+                 ByteBufferUtil.writeWithShortLength(expr.value, out);
++                if (expr.getLogicalOp() == null)
++                    out.writeInt(-1);
++                else
++                    out.writeInt(expr.getLogicalOp().getValue());
+             }
+         }
+         AbstractBounds.serializer.serialize(sliceCommand.keyRange, out, version);
+@@ -263,6 +267,7 @@ class RangeSliceCommandSerializer implements IVersionedSerializer<RangeSliceComm
+             expr = new IndexExpression(ByteBufferUtil.readWithShortLength(in),
+                                        IndexOperator.findByValue(in.readInt()),
+                                        ByteBufferUtil.readWithShortLength(in));
++            expr.setLogicalOp(LogicalIndexOperator.findByValue(in.readInt()));
+             rowFilter.add(expr);
+         }
+         AbstractBounds<RowPosition> range = AbstractBounds.serializer.deserialize(in, version).toRowBounds();
+@@ -318,6 +323,10 @@ class RangeSliceCommandSerializer implements IVersionedSerializer<RangeSliceComm
+                 size += TypeSizes.NATIVE.sizeofWithShortLength(expr.column_name);
+                 size += TypeSizes.NATIVE.sizeof(expr.op.getValue());
+                 size += TypeSizes.NATIVE.sizeofWithShortLength(expr.value);
++                if (expr.getLogicalOp() != null)
++                    size += TypeSizes.NATIVE.sizeof(expr.logicalOp.getValue());
++                else
++                    size += TypeSizes.NATIVE.sizeof(-1);
+             }
+         }
+         size += AbstractBounds.serializer.serializedSize(rsc.keyRange, version);
+diff --git a/src/java/org/apache/cassandra/db/filter/ExtendedFilter.java b/src/java/org/apache/cassandra/db/filter/ExtendedFilter.java
+index e03eba1..e2a5797 100644
+--- a/src/java/org/apache/cassandra/db/filter/ExtendedFilter.java
++++ b/src/java/org/apache/cassandra/db/filter/ExtendedFilter.java
+@@ -224,7 +224,8 @@ public abstract class ExtendedFilter
+                     SortedSet<ByteBuffer> columns = new TreeSet<ByteBuffer>(cfs.getComparator());
+                     for (IndexExpression expr : clause)
+                     {
+-                        columns.add(expr.column_name);
++                        if (expr.column_name != null)
++                            columns.add(expr.column_name);
+                     }
+                     columns.addAll(((NamesQueryFilter) filter).columns);
+                     return ((NamesQueryFilter) filter).withUpdatedColumns(columns);
+@@ -310,6 +311,9 @@ public abstract class ExtendedFilter
+             // where the index returned a row which doesn't have the primary column when we actually read it
+             for (IndexExpression expression : clause)
+             {
++                if (expression.isSetLogicalOp())
++                    continue;
++
+                 ColumnDefinition def = data.metadata().getColumnDefinition(expression.column_name);
+                 ByteBuffer dataValue = null;
+                 AbstractType<?> validator = null;
+diff --git a/src/java/org/apache/cassandra/thrift/ThriftValidation.java b/src/java/org/apache/cassandra/thrift/ThriftValidation.java
+index be95409..0a176f6 100644
+--- a/src/java/org/apache/cassandra/thrift/ThriftValidation.java
++++ b/src/java/org/apache/cassandra/thrift/ThriftValidation.java
+@@ -586,6 +586,10 @@ public class ThriftValidation
+         boolean isIndexed = false;
+         for (IndexExpression expression : index_clause)
+         {
++            // skip validation of logical op IndexExpression
++            if (expression.column_name.capacity() == 0)
++                continue;
++
+             try
+             {
+                 nameValidator.validate(expression.column_name);
+diff --git a/test/unit/org/apache/cassandra/SchemaLoader.java b/test/unit/org/apache/cassandra/SchemaLoader.java
+index 6b34b9a..f77acbf 100644
+--- a/test/unit/org/apache/cassandra/SchemaLoader.java
++++ b/test/unit/org/apache/cassandra/SchemaLoader.java
+@@ -25,6 +25,8 @@ import java.util.*;
+ 
+ import org.apache.cassandra.db.index.PerRowSecondaryIndexTest;
+ import org.apache.cassandra.db.index.SecondaryIndex;
++import org.apache.cassandra.db.index.SSTableAttachedSecondaryIndex;
++import org.apache.cassandra.db.index.sasi.disk.OnDiskIndexBuilder;
+ import org.junit.AfterClass;
+ import org.junit.BeforeClass;
+ import org.slf4j.Logger;
+@@ -36,6 +38,7 @@ import org.apache.cassandra.db.commitlog.CommitLog;
+ import org.apache.cassandra.db.compaction.LeveledCompactionStrategy;
+ import org.apache.cassandra.db.filter.QueryFilter;
+ import org.apache.cassandra.db.marshal.*;
++import org.apache.cassandra.dht.Murmur3Partitioner;
+ import org.apache.cassandra.exceptions.ConfigurationException;
+ import org.apache.cassandra.gms.Gossiper;
+ import org.apache.cassandra.io.compress.CompressionParameters;
+@@ -114,6 +117,7 @@ public class SchemaLoader
+         String ks_nocommit = "NoCommitlogSpace";
+         String ks_prsi = "PerRowSecondaryIndex";
+         String ks_cql = "cql_keyspace";
++        String ks_sai = "sasecondaryindex";
+ 
+         Class<? extends AbstractReplicationStrategy> simple = SimpleStrategy.class;
+ 
+@@ -347,6 +351,12 @@ public class SchemaLoader
+                                                    + "WITH COMPACT STORAGE", ks_cql)
+                                            ));
+ 
++        if (DatabaseDescriptor.getPartitioner() instanceof Murmur3Partitioner)
++            schema.add(KSMetaData.testMetadataNotDurable(ks_sai,
++                                                         simple,
++                                                         opts_rf1,
++                                                         saIndexedCFMD(ks_sai, "saindexed1")));
++
+ 
+         if (Boolean.parseBoolean(System.getProperty("cassandra.test.compression", "false")))
+             useCompression(schema, compressionChunkLength);
+@@ -373,6 +383,158 @@ public class SchemaLoader
+                 }});
+     }
+ 
++    private static CFMetaData saIndexedCFMD(String ksName, final String cfName)
++    {
++        return new CFMetaData(ksName, cfName, ColumnFamilyType.Standard, UTF8Type.instance, null)
++                .keyValidator(AsciiType.instance)
++                .columnMetadata(new HashMap<ByteBuffer, ColumnDefinition>()
++                {{
++                        ByteBuffer cName = UTF8Type.instance.decompose("first_name");
++                        put(cName, new ColumnDefinition(cName,
++                                UTF8Type.instance,
++                                IndexType.CUSTOM,
++                                new HashMap<String, String>()
++                                {{
++                                    put(SecondaryIndex.CUSTOM_INDEX_OPTION_NAME, SSTableAttachedSecondaryIndex.class.getName());
++                                    put("mode", OnDiskIndexBuilder.Mode.SUFFIX.toString());
++                                }},
++                                UTF8Type.instance.compose(cName),
++                                null, ColumnDefinition.Type.REGULAR));
++
++                        cName = UTF8Type.instance.decompose("last_name");
++                        put(cName, new ColumnDefinition(cName,
++                                UTF8Type.instance,
++                                IndexType.CUSTOM,
++                                new HashMap<String, String>()
++                                {{
++                                    put(SecondaryIndex.CUSTOM_INDEX_OPTION_NAME, SSTableAttachedSecondaryIndex.class.getName());
++                                    put("mode", OnDiskIndexBuilder.Mode.SUFFIX.toString());
++                                }},
++                                UTF8Type.instance.compose(cName),
++                                null, ColumnDefinition.Type.REGULAR));
++
++                        cName = UTF8Type.instance.decompose("age");
++                        put(cName, new ColumnDefinition(cName,
++                                Int32Type.instance,
++                                IndexType.CUSTOM,
++                                new HashMap<String, String>()
++                                {{
++                                    put(SecondaryIndex.CUSTOM_INDEX_OPTION_NAME, SSTableAttachedSecondaryIndex.class.getName());
++                                    put("mode", OnDiskIndexBuilder.Mode.ORIGINAL.toString());
++                                }},
++                                UTF8Type.instance.compose(cName),
++                                null, ColumnDefinition.Type.REGULAR));
++
++                        cName = UTF8Type.instance.decompose("height");
++                        put(cName, ColumnDefinition.regularDef(cName, Int32Type.instance, null));
++
++                        cName = UTF8Type.instance.decompose("timestamp");
++                        put(cName, new ColumnDefinition(cName,
++                                LongType.instance,
++                                IndexType.CUSTOM,
++                                new HashMap<String, String>()
++                                {{
++                                    put(SecondaryIndex.CUSTOM_INDEX_OPTION_NAME, SSTableAttachedSecondaryIndex.class.getName());
++                                    put("mode", OnDiskIndexBuilder.Mode.SPARSE.toString());
++                                }},
++                                UTF8Type.instance.compose(cName),
++                                null, ColumnDefinition.Type.REGULAR));
++
++                        cName = UTF8Type.instance.decompose("address");
++                        put(cName, new ColumnDefinition(cName,
++                                AsciiType.instance,
++                                IndexType.CUSTOM,
++                                new HashMap<String, String>()
++                                {{
++                                        put("analyzer_class", "org.apache.cassandra.db.index.sasi.analyzer.NonTokenizingAnalyzer");
++                                        put(SecondaryIndex.CUSTOM_INDEX_OPTION_NAME, SSTableAttachedSecondaryIndex.class.getName());
++                                        put("mode", OnDiskIndexBuilder.Mode.ORIGINAL.toString());
++                                        put("case_sensitive", "false");
++                                }},
++                                "address",
++                                null, ColumnDefinition.Type.REGULAR));
++
++                        cName = UTF8Type.instance.decompose("score");
++                        put(cName, new ColumnDefinition(cName,
++                                DoubleType.instance,
++                                IndexType.CUSTOM,
++                                new HashMap<String, String>()
++                                {{
++                                    put(SecondaryIndex.CUSTOM_INDEX_OPTION_NAME, SSTableAttachedSecondaryIndex.class.getName());
++                                    put("mode", OnDiskIndexBuilder.Mode.ORIGINAL.toString());
++                                }},
++                                UTF8Type.instance.compose(cName),
++                                null, ColumnDefinition.Type.REGULAR));
++
++                        cName = UTF8Type.instance.decompose("comment");
++                        put(cName, new ColumnDefinition(cName,
++                                UTF8Type.instance,
++                                IndexType.CUSTOM,
++                                new HashMap<String, String>()
++                                {{
++                                        put(SecondaryIndex.CUSTOM_INDEX_OPTION_NAME, SSTableAttachedSecondaryIndex.class.getName());
++                                        put("mode", OnDiskIndexBuilder.Mode.ORIGINAL.toString());
++                                        put("analyzed", "true");
++                                }},
++                                UTF8Type.instance.compose(cName),
++                                null, ColumnDefinition.Type.REGULAR));
++
++                        cName = UTF8Type.instance.decompose("comment_suffix_split");
++                        put(cName, new ColumnDefinition(cName,
++                                UTF8Type.instance,
++                                IndexType.CUSTOM,
++                                new HashMap<String, String>()
++                                {{
++                                        put(SecondaryIndex.CUSTOM_INDEX_OPTION_NAME, SSTableAttachedSecondaryIndex.class.getName());
++                                        put("mode", OnDiskIndexBuilder.Mode.SUFFIX.toString());
++                                        put("analyzed", "false");
++                                }},
++                                UTF8Type.instance.compose(cName),
++                                null, ColumnDefinition.Type.REGULAR));
++
++                        cName = UTF8Type.instance.decompose("/output/full-name/");
++                        put(cName, new ColumnDefinition(cName,
++                                UTF8Type.instance,
++                                IndexType.CUSTOM,
++                                new HashMap<String, String>()
++                                {{
++                                        put(SecondaryIndex.CUSTOM_INDEX_OPTION_NAME, SSTableAttachedSecondaryIndex.class.getName());
++                                        put("mode", OnDiskIndexBuilder.Mode.ORIGINAL.toString());
++                                        put("analyzed", "true");
++                                        put("analyzer_class", "org.apache.cassandra.db.index.sasi.analyzer.NonTokenizingAnalyzer");
++                                        put("case_sensitive", "false");
++                                    }},
++                                "output_full_name",
++                                null, ColumnDefinition.Type.REGULAR));
++
++                        cName = UTF8Type.instance.decompose("/data/output/id");
++                        put(cName, new ColumnDefinition(cName,
++                                AsciiType.instance,
++                                IndexType.CUSTOM,
++                                new HashMap<String, String>()
++                                {{
++                                        put(SecondaryIndex.CUSTOM_INDEX_OPTION_NAME, SSTableAttachedSecondaryIndex.class.getName());
++                                        put("mode", OnDiskIndexBuilder.Mode.SUFFIX.toString());
++                                    }},
++                                "data_output_id",
++                                null, ColumnDefinition.Type.REGULAR));
++
++                        cName = UTF8Type.instance.decompose("first_name_prefix");
++                        put(cName, new ColumnDefinition(cName,
++                                UTF8Type.instance,
++                                IndexType.CUSTOM,
++                                new HashMap<String, String>()
++                                {{
++                                        put(SecondaryIndex.CUSTOM_INDEX_OPTION_NAME, SSTableAttachedSecondaryIndex.class.getName());
++                                        put("mode", OnDiskIndexBuilder.Mode.ORIGINAL.toString());
++                                        put("analyzed", "true");
++                                        put("tokenization_normalize_lowercase", "true");
++                                }},
++                                "first_name_prefix",
++                                null, ColumnDefinition.Type.REGULAR));
++                        }});
++    }
++
+     private static void useCompression(List<KSMetaData> schema, Integer chunkLength) throws ConfigurationException
+     {
+         for (KSMetaData ksm : schema)
+-- 
+2.6.0
+

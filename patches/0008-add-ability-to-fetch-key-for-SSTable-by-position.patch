@@ -1,0 +1,128 @@
+From b38ee455ea8c0845da1330844102f2c10a9b4ba9 Mon Sep 17 00:00:00 2001
+From: Pavel Yaskevich <xedin@apache.org>
+Date: Mon, 2 Nov 2015 17:00:54 -0800
+Subject: [PATCH 08/10] add ability to fetch key for SSTable by position
+
+---
+ .../apache/cassandra/io/sstable/KeyIterator.java   |  8 ++++
+ .../apache/cassandra/io/sstable/SSTableReader.java | 49 +++++++++++++++++-----
+ 2 files changed, 46 insertions(+), 11 deletions(-)
+
+diff --git a/src/java/org/apache/cassandra/io/sstable/KeyIterator.java b/src/java/org/apache/cassandra/io/sstable/KeyIterator.java
+index f4f7ee5..758a4c6 100644
+--- a/src/java/org/apache/cassandra/io/sstable/KeyIterator.java
++++ b/src/java/org/apache/cassandra/io/sstable/KeyIterator.java
+@@ -32,6 +32,7 @@ import org.apache.cassandra.utils.CloseableIterator;
+ public class KeyIterator extends AbstractIterator<DecoratedKey> implements CloseableIterator<DecoratedKey>
+ {
+     private final RandomAccessReader in;
++    private long keyPosition;
+ 
+     public KeyIterator(Descriptor desc)
+     {
+@@ -45,6 +46,8 @@ public class KeyIterator extends AbstractIterator<DecoratedKey> implements Close
+         {
+             if (in.isEOF())
+                 return endOfData();
++
++            keyPosition = in.getFilePointer();
+             DecoratedKey key = StorageService.getPartitioner().decorateKey(ByteBufferUtil.readWithShortLength(in));
+             RowIndexEntry.serializer.skip(in); // skip remainder of the entry
+             return key;
+@@ -69,4 +72,9 @@ public class KeyIterator extends AbstractIterator<DecoratedKey> implements Close
+     {
+         return in.length();
+     }
++
++    public long getKeyPosition()
++    {
++        return keyPosition;
++    }
+ }
+diff --git a/src/java/org/apache/cassandra/io/sstable/SSTableReader.java b/src/java/org/apache/cassandra/io/sstable/SSTableReader.java
+index 39d46e9..5d6b906 100644
+--- a/src/java/org/apache/cassandra/io/sstable/SSTableReader.java
++++ b/src/java/org/apache/cassandra/io/sstable/SSTableReader.java
+@@ -493,8 +493,8 @@ public class SSTableReader extends SSTable implements Closeable
+             saveSummary(this, ibuilder, dbuilder);
+     }
+ 
+-     private void buildSummary(boolean recreateBloomFilter, SegmentedFile.Builder ibuilder, SegmentedFile.Builder dbuilder, boolean summaryLoaded) throws IOException
+-     {
++    private void buildSummary(boolean recreateBloomFilter, SegmentedFile.Builder ibuilder, SegmentedFile.Builder dbuilder, boolean summaryLoaded) throws IOException
++    {
+          if (!components.contains(Component.PRIMARY_INDEX))
+              return;
+ 
+@@ -875,21 +875,23 @@ public class SSTableReader extends SSTable implements Closeable
+ 
+     public void cacheKey(DecoratedKey key, RowIndexEntry info)
+     {
+-        CFMetaData.Caching caching = metadata.getCaching();
+-
+-        if (caching == CFMetaData.Caching.NONE
+-            || caching == CFMetaData.Caching.ROWS_ONLY
+-            || keyCache == null
+-            || keyCache.getCapacity() == 0)
+-        {
++        if (!isKeyCacheEnabled())
+             return;
+-        }
+ 
+         KeyCacheKey cacheKey = new KeyCacheKey(descriptor, key.key);
+-        logger.trace("Adding cache entry for {} -> {}", cacheKey, info);
++
++        if (logger.isTraceEnabled())
++            logger.trace("Adding cache entry for {} -> {}", cacheKey, info);
++
+         keyCache.put(cacheKey, info);
+     }
+ 
++    private boolean isKeyCacheEnabled()
++    {
++        CFMetaData.Caching caching = metadata.getCaching();
++        return (caching == CFMetaData.Caching.ALL || caching == CFMetaData.Caching.KEYS_ONLY) && keyCache != null && keyCache.getCapacity() > 0;
++    }
++
+     public void preheat(Map<DecoratedKey, RowIndexEntry> cachedKeys) throws IOException
+     {
+         RandomAccessFile f = new RandomAccessFile(getFilename(), "r");
+@@ -1301,10 +1303,35 @@ public class SSTableReader extends SSTable implements Closeable
+         {
+             File sourceFile = new File(descriptor.filenameFor(component));
+             File targetLink = new File(snapshotDirectoryPath, sourceFile.getName());
++
++            // some of the SI components could be missing but that just means that SSTable didn't have those columns
++            if (component.type.equals(Component.Type.SECONDARY_INDEX) && !sourceFile.exists())
++                continue;
++
+             FileUtils.createHardLink(sourceFile, targetLink);
+         }
+     }
+ 
++    public DecoratedKey keyAt(long indexPosition) throws IOException
++    {
++        DecoratedKey key;
++        try (FileDataInput in = ifile.getSegment(indexPosition))
++        {
++            if (in.isEOF())
++                return null;
++
++            key = partitioner.decorateKey(ByteBufferUtil.readWithShortLength(in));
++
++            // hint read path about key location if caching is enabled
++            // this saves index summary lookup and index file iteration which whould be pretty costly
++            // especially in presence of promoted column indexes
++            if (isKeyCacheEnabled())
++                cacheKey(key, RowIndexEntry.serializer.deserialize(in, descriptor.version));
++        }
++
++        return key;
++    }
++
+     /**
+      * TODO: Move someplace reusable
+      */
+-- 
+2.6.0
+

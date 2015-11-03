@@ -1,0 +1,1481 @@
+From 61da676336f6b93ac5d55df31726a7ba6622795e Mon Sep 17 00:00:00 2001
+From: Pavel Yaskevich <xedin@apache.org>
+Date: Mon, 2 Nov 2015 16:49:27 -0800
+Subject: [PATCH 04/10] add sstable write listener support
+
+---
+ .../org/apache/cassandra/db/ColumnFamilyStore.java |  10 +-
+ src/java/org/apache/cassandra/db/ColumnIndex.java  |  11 +-
+ src/java/org/apache/cassandra/db/Memtable.java     |   6 +-
+ .../db/compaction/AbstractCompactedRow.java        |  13 +-
+ .../db/compaction/AbstractCompactionStrategy.java  |   8 +-
+ .../cassandra/db/compaction/CompactionManager.java |   7 +-
+ .../cassandra/db/compaction/CompactionTask.java    |   4 +-
+ .../db/compaction/LazilyCompactedRow.java          |  11 +-
+ .../cassandra/db/compaction/PrecompactedRow.java   |  11 +-
+ .../apache/cassandra/db/compaction/Upgrader.java   |   2 +-
+ .../apache/cassandra/db/index/IndexBuildTask.java  |  25 ++++
+ .../apache/cassandra/db/index/SecondaryIndex.java  |  52 +++++++-
+ .../cassandra/db/index/SecondaryIndexBuilder.java  |   2 +-
+ .../cassandra/db/index/SecondaryIndexManager.java  |  60 +++++++--
+ .../apache/cassandra/exceptions/ExceptionCode.java |   4 +-
+ .../io/sstable/AbstractSSTableSimpleWriter.java    |   5 +-
+ .../apache/cassandra/io/sstable/SSTableWriter.java | 142 ++++++++++++++-------
+ .../io/sstable/SSTableWriterListener.java          |  50 ++++++++
+ .../apache/cassandra/streaming/StreamReader.java   |   3 +-
+ .../streaming/compress/CompressedStreamReader.java |   1 +
+ .../org/apache/cassandra/tools/SSTableImport.java  |  13 +-
+ .../apache/cassandra/db/ColumnFamilyStoreTest.java |  24 ++--
+ .../org/apache/cassandra/db/RowIndexEntryTest.java |   4 +-
+ .../cassandra/db/compaction/CompactionsTest.java   |   6 +-
+ .../cassandra/io/LazilyCompactedRowTest.java       |   8 +-
+ .../compress/CompressedSequentialWriterTest.java   |   2 +-
+ .../apache/cassandra/io/sstable/SSTableUtils.java  |   3 +-
+ .../apache/cassandra/tools/SSTableExportTest.java  |  63 +++++----
+ .../cassandra/triggers/TriggerExecutorTest.java    |   6 +-
+ 29 files changed, 416 insertions(+), 140 deletions(-)
+ create mode 100644 src/java/org/apache/cassandra/db/index/IndexBuildTask.java
+ create mode 100644 src/java/org/apache/cassandra/io/sstable/SSTableWriterListener.java
+
+diff --git a/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index eb688f7..851e12f 100644
+--- a/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -265,11 +265,16 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
+         // scan for sstables corresponding to this cf and load them
+         data = new DataTracker(this);
+ 
++        Collection<SSTableReader> initialSstables;
+         if (loadSSTables)
+         {
+             Directories.SSTableLister sstableFiles = directories.sstableLister().skipTemporary(true);
+-            Collection<SSTableReader> sstables = SSTableReader.openAll(sstableFiles.list().entrySet(), metadata, this.partitioner);
+-            data.addInitialSSTables(sstables);
++            initialSstables = SSTableReader.openAll(sstableFiles.list().entrySet(), metadata, this.partitioner);
++            data.addInitialSSTables(initialSstables);
++        }
++        else
++        {
++            initialSstables = Collections.emptyList();
+         }
+ 
+         if (caching == Caching.ALL || caching == Caching.KEYS_ONLY)
+@@ -291,6 +296,7 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
+             if (info.getIndexType() != null)
+                 indexManager.addIndexedColumn(info);
+         }
++        indexManager.candidatesForIndexing(initialSstables);
+ 
+         // register the mbean
+         String type = this.partitioner instanceof LocalPartitioner ? "IndexColumnFamilies" : "ColumnFamilies";
+diff --git a/src/java/org/apache/cassandra/db/ColumnIndex.java b/src/java/org/apache/cassandra/db/ColumnIndex.java
+index eda275d..d3c0087 100644
+--- a/src/java/org/apache/cassandra/db/ColumnIndex.java
++++ b/src/java/org/apache/cassandra/db/ColumnIndex.java
+@@ -26,6 +26,7 @@ import com.google.common.annotations.VisibleForTesting;
+ 
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.io.sstable.IndexHelper;
++import org.apache.cassandra.io.sstable.SSTableWriterListener;
+ import org.apache.cassandra.utils.ByteBufferUtil;
+ 
+ public class ColumnIndex
+@@ -68,10 +69,12 @@ public class ColumnIndex
+         private int atomCount;
+         private final ByteBuffer key;
+         private final DeletionInfo deletionInfo; // only used for serializing and calculating row header size
++        private final Collection<SSTableWriterListener> listeners;
+ 
+         public Builder(ColumnFamily cf,
+                        ByteBuffer key,
+-                       DataOutput output)
++                       DataOutput output,
++                       Collection<SSTableWriterListener> listeners)
+         {
+             assert cf != null;
+             assert key != null;
+@@ -83,6 +86,7 @@ public class ColumnIndex
+             this.result = new ColumnIndex(new ArrayList<IndexHelper.IndexInfo>());
+             this.output = output;
+             this.tombstoneTracker = new RangeTombstone.Tracker(cf.getComparator());
++            this.listeners = listeners;
+         }
+ 
+         /**
+@@ -192,6 +196,11 @@ public class ColumnIndex
+             tombstoneTracker.update(column, false);
+ 
+             lastColumn = column;
++            if (listeners != null && column instanceof Column)
++            {
++                for (SSTableWriterListener listener : listeners)
++                    listener.nextColumn((Column)column);
++            }
+         }
+ 
+         private void maybeWriteRowHeader() throws IOException
+diff --git a/src/java/org/apache/cassandra/db/Memtable.java b/src/java/org/apache/cassandra/db/Memtable.java
+index 897d94e..7db8627 100644
+--- a/src/java/org/apache/cassandra/db/Memtable.java
++++ b/src/java/org/apache/cassandra/db/Memtable.java
+@@ -24,6 +24,8 @@ import java.util.concurrent.atomic.AtomicLong;
+ 
+ import com.google.common.base.Function;
+ import com.google.common.base.Throwables;
++
++import org.apache.cassandra.io.sstable.SSTableWriterListener;
+ import org.apache.cassandra.utils.*;
+ import org.cliffc.high_scale_lib.NonBlockingHashSet;
+ import org.slf4j.Logger;
+@@ -425,7 +427,9 @@ public class Memtable
+                                      rows.size(),
+                                      cfs.metadata,
+                                      cfs.partitioner,
+-                                     sstableMetadataCollector);
++                                     sstableMetadataCollector,
++                                     SSTableWriterListener.Source.MEMTABLE,
++                                     cfs.indexManager.getIndexes());
+         }
+     }
+ 
+diff --git a/src/java/org/apache/cassandra/db/compaction/AbstractCompactedRow.java b/src/java/org/apache/cassandra/db/compaction/AbstractCompactedRow.java
+index 734155e..1457383 100644
+--- a/src/java/org/apache/cassandra/db/compaction/AbstractCompactedRow.java
++++ b/src/java/org/apache/cassandra/db/compaction/AbstractCompactedRow.java
+@@ -21,10 +21,13 @@ import java.io.Closeable;
+ import java.io.DataOutput;
+ import java.io.IOException;
+ import java.security.MessageDigest;
++import java.util.Collection;
+ 
+ import org.apache.cassandra.db.DecoratedKey;
+ import org.apache.cassandra.db.RowIndexEntry;
+ import org.apache.cassandra.io.sstable.ColumnStats;
++import org.apache.cassandra.io.sstable.SSTableWriterListener;
++import org.apache.cassandra.utils.Pair;
+ 
+ /**
+  * a CompactedRow is an object that takes a bunch of rows (keys + columnfamilies)
+@@ -47,7 +50,15 @@ public abstract class AbstractCompactedRow implements Closeable
+      *
+      * @return index information for the written row, or null if the compaction resulted in only expired tombstones.
+      */
+-    public abstract RowIndexEntry write(long currentPosition, DataOutput out) throws IOException;
++    public RowIndexEntry write(Pair<Long, Long> currentPositions, DataOutput out, Collection<SSTableWriterListener> listeners) throws IOException
++    {
++        assert listeners != null;
++        for (SSTableWriterListener listener : listeners)
++            listener.startRow(key, currentPositions.left);
++        return writeInternal(currentPositions.right, out, listeners);
++    }
++
++    protected abstract RowIndexEntry writeInternal(long currentPosition, DataOutput out, Collection<SSTableWriterListener> listeners) throws IOException;
+ 
+     /**
+      * update @param digest with the data bytes of the row (not including row key or row size).
+diff --git a/src/java/org/apache/cassandra/db/compaction/AbstractCompactionStrategy.java b/src/java/org/apache/cassandra/db/compaction/AbstractCompactionStrategy.java
+index 30081ca..83460f8 100644
+--- a/src/java/org/apache/cassandra/db/compaction/AbstractCompactionStrategy.java
++++ b/src/java/org/apache/cassandra/db/compaction/AbstractCompactionStrategy.java
+@@ -235,11 +235,15 @@ public abstract class AbstractCompactionStrategy
+     }
+ 
+     /**
+-     * @return a subset of the suggested sstables that are relevant for read requests.
++     * @return a subset of the suggested sstables that are relevant for read requests,
++     *         this method would also filter out SSTables which are suspect for corruption.
+      */
+     public List<SSTableReader> filterSSTablesForReads(List<SSTableReader> sstables)
+     {
+-        return sstables;
++        List<SSTableReader> validSSTables = new ArrayList<>(sstables.size());
++        for (SSTableReader sstable : filterSuspectSSTables(sstables))
++            validSSTables.add(sstable);
++        return validSSTables;
+     }
+ 
+     /**
+diff --git a/src/java/org/apache/cassandra/db/compaction/CompactionManager.java b/src/java/org/apache/cassandra/db/compaction/CompactionManager.java
+index 9d71dc7..774ee3f 100644
+--- a/src/java/org/apache/cassandra/db/compaction/CompactionManager.java
++++ b/src/java/org/apache/cassandra/db/compaction/CompactionManager.java
+@@ -30,6 +30,7 @@ import javax.management.openmbean.TabularData;
+ import com.google.common.base.Throwables;
+ import com.google.common.collect.*;
+ import com.google.common.util.concurrent.RateLimiter;
++import org.apache.cassandra.db.index.IndexBuildTask;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -42,7 +43,6 @@ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.config.Schema;
+ import org.apache.cassandra.db.*;
+ import org.apache.cassandra.db.compaction.CompactionInfo.Holder;
+-import org.apache.cassandra.db.index.SecondaryIndexBuilder;
+ import org.apache.cassandra.dht.Bounds;
+ import org.apache.cassandra.dht.Range;
+ import org.apache.cassandra.dht.Token;
+@@ -742,7 +742,8 @@ public class CompactionManager implements CompactionManagerMBean
+                                  expectedBloomFilterSize,
+                                  cfs.metadata,
+                                  cfs.partitioner,
+-                                 SSTableMetadata.createCollector(Collections.singleton(sstable), cfs.metadata.comparator, sstable.getSSTableLevel()));
++                                 SSTableMetadata.createCollector(Collections.singleton(sstable), cfs.metadata.comparator, sstable.getSSTableLevel()),
++                                 cfs.indexManager.getIndexes());
+     }
+ 
+     /**
+@@ -820,7 +821,7 @@ public class CompactionManager implements CompactionManagerMBean
+     /**
+      * Is not scheduled, because it is performing disjoint work from sstable compaction.
+      */
+-    public Future<?> submitIndexBuild(final SecondaryIndexBuilder builder)
++    public Future<?> submitIndexBuild(final IndexBuildTask builder)
+     {
+         Runnable runnable = new Runnable()
+         {
+diff --git a/src/java/org/apache/cassandra/db/compaction/CompactionTask.java b/src/java/org/apache/cassandra/db/compaction/CompactionTask.java
+index 9f7c8dd..1c1ad36 100644
+--- a/src/java/org/apache/cassandra/db/compaction/CompactionTask.java
++++ b/src/java/org/apache/cassandra/db/compaction/CompactionTask.java
+@@ -195,6 +195,7 @@ public class CompactionTask extends AbstractCompactionTask
+                     cachedKeyMap.put(writer.descriptor.asTemporary(false), cachedKeys);
+                     writeSize = getExpectedWriteSize() / estimatedSSTables;
+                     dataDirectory = getWriteDirectory(writeSize);
++                    writer.complete();
+                     writer = createCompactionWriter(cfs.directories.getLocationForDisk(dataDirectory), keysPerSSTable);
+                     writers.add(writer);
+                     cachedKeys = new HashMap<>();
+@@ -317,7 +318,8 @@ public class CompactionTask extends AbstractCompactionTask
+                                  keysPerSSTable,
+                                  cfs.metadata,
+                                  cfs.partitioner,
+-                                 SSTableMetadata.createCollector(toCompact, cfs.metadata.comparator, getLevel()));
++                                 SSTableMetadata.createCollector(toCompact, cfs.metadata.comparator, getLevel()),
++                                 cfs.indexManager.getIndexes());
+     }
+ 
+     protected int getLevel()
+diff --git a/src/java/org/apache/cassandra/db/compaction/LazilyCompactedRow.java b/src/java/org/apache/cassandra/db/compaction/LazilyCompactedRow.java
+index 43801c6..68d0394 100644
+--- a/src/java/org/apache/cassandra/db/compaction/LazilyCompactedRow.java
++++ b/src/java/org/apache/cassandra/db/compaction/LazilyCompactedRow.java
+@@ -21,9 +21,7 @@ import java.io.DataOutput;
+ import java.io.IOException;
+ import java.nio.ByteBuffer;
+ import java.security.MessageDigest;
+-import java.util.Collections;
+-import java.util.Iterator;
+-import java.util.List;
++import java.util.*;
+ 
+ import com.google.common.base.Predicates;
+ import com.google.common.collect.Iterators;
+@@ -36,6 +34,7 @@ import org.apache.cassandra.io.sstable.ColumnNameHelper;
+ import org.apache.cassandra.io.sstable.ColumnStats;
+ import org.apache.cassandra.io.sstable.SSTable;
+ import org.apache.cassandra.io.sstable.SSTableWriter;
++import org.apache.cassandra.io.sstable.SSTableWriterListener;
+ import org.apache.cassandra.io.util.DataOutputBuffer;
+ import org.apache.cassandra.utils.MergeIterator;
+ import org.apache.cassandra.utils.StreamingHistogram;
+@@ -90,14 +89,14 @@ public class LazilyCompactedRow extends AbstractCompactedRow implements Iterable
+             emptyColumnFamily.purgeTombstones(controller.gcBefore);
+     }
+ 
+-    public RowIndexEntry write(long currentPosition, DataOutput out) throws IOException
++    public RowIndexEntry writeInternal(long currentPosition, DataOutput out, Collection<SSTableWriterListener> listeners) throws IOException
+     {
+         assert !closed;
+ 
+         ColumnIndex columnsIndex;
+         try
+         {
+-            indexBuilder = new ColumnIndex.Builder(emptyColumnFamily, key.key, out);
++            indexBuilder = new ColumnIndex.Builder(emptyColumnFamily, key.key, out, listeners);
+             columnsIndex = indexBuilder.buildForCompaction(iterator());
+ 
+             // if there aren't any columns or tombstones, return null
+@@ -142,7 +141,7 @@ public class LazilyCompactedRow extends AbstractCompactedRow implements Iterable
+         DataOutputBuffer out = new DataOutputBuffer();
+ 
+         // initialize indexBuilder for the benefit of its tombstoneTracker, used by our reducing iterator
+-        indexBuilder = new ColumnIndex.Builder(emptyColumnFamily, key.key, out);
++        indexBuilder = new ColumnIndex.Builder(emptyColumnFamily, key.key, out, Collections.<SSTableWriterListener>emptyList());
+ 
+         try
+         {
+diff --git a/src/java/org/apache/cassandra/db/compaction/PrecompactedRow.java b/src/java/org/apache/cassandra/db/compaction/PrecompactedRow.java
+index db72847..a7b2d77 100644
+--- a/src/java/org/apache/cassandra/db/compaction/PrecompactedRow.java
++++ b/src/java/org/apache/cassandra/db/compaction/PrecompactedRow.java
+@@ -21,6 +21,7 @@ import java.io.DataOutput;
+ import java.io.IOException;
+ import java.security.MessageDigest;
+ import java.util.ArrayList;
++import java.util.Collection;
+ import java.util.Comparator;
+ import java.util.Iterator;
+ import java.util.List;
+@@ -32,6 +33,7 @@ import org.apache.cassandra.db.index.SecondaryIndexManager;
+ import org.apache.cassandra.io.sstable.ColumnStats;
+ import org.apache.cassandra.io.sstable.SSTableIdentityIterator;
+ import org.apache.cassandra.io.sstable.SSTableWriter;
++import org.apache.cassandra.io.sstable.SSTableWriterListener;
+ import org.apache.cassandra.io.util.DataOutputBuffer;
+ import org.apache.cassandra.utils.CloseableIterator;
+ import org.apache.cassandra.utils.FBUtilities;
+@@ -144,12 +146,17 @@ public class PrecompactedRow extends AbstractCompactedRow
+         filter.collectReducedColumns(returnCF, reduced, CompactionManager.NO_GC, System.currentTimeMillis());
+     }
+ 
+-    public RowIndexEntry write(long currentPosition, DataOutput out) throws IOException
++    public RowIndexEntry writeInternal(long currentPosition, DataOutput out, Collection<SSTableWriterListener> listeners) throws IOException
+     {
+         if (compactedCf == null)
+             return null;
++        assert compactedCf.getColumnCount() > 0 || compactedCf.isMarkedForDelete();
+ 
+-        return SSTableWriter.rawAppend(compactedCf, currentPosition, key, out);
++        ColumnIndex.Builder builder = new ColumnIndex.Builder(compactedCf, key.key, out, listeners);
++        ColumnIndex index = builder.build(compactedCf);
++
++        out.writeShort(SSTableWriter.END_OF_ROW);
++        return RowIndexEntry.create(currentPosition, compactedCf.deletionInfo().getTopLevelDeletion(), index);
+     }
+ 
+     public void update(MessageDigest digest)
+diff --git a/src/java/org/apache/cassandra/db/compaction/Upgrader.java b/src/java/org/apache/cassandra/db/compaction/Upgrader.java
+index 98a55e9..78af37c 100644
+--- a/src/java/org/apache/cassandra/db/compaction/Upgrader.java
++++ b/src/java/org/apache/cassandra/db/compaction/Upgrader.java
+@@ -78,7 +78,7 @@ public class Upgrader
+             sstableMetadataCollector.sstableLevel(sstable.getSSTableLevel());
+         }
+ 
+-        return new SSTableWriter(cfs.getTempSSTablePath(directory), estimatedRows, cfs.metadata, cfs.partitioner, sstableMetadataCollector);
++        return new SSTableWriter(cfs.getTempSSTablePath(directory), estimatedRows, cfs.metadata, cfs.partitioner, sstableMetadataCollector, cfs.indexManager.getIndexes());
+     }
+ 
+     public void upgrade()
+diff --git a/src/java/org/apache/cassandra/db/index/IndexBuildTask.java b/src/java/org/apache/cassandra/db/index/IndexBuildTask.java
+new file mode 100644
+index 0000000..079bf76
+--- /dev/null
++++ b/src/java/org/apache/cassandra/db/index/IndexBuildTask.java
+@@ -0,0 +1,25 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.cassandra.db.index;
++
++import org.apache.cassandra.db.compaction.CompactionInfo;
++
++public abstract class IndexBuildTask extends CompactionInfo.Holder
++{
++    public abstract void build();
++}
+diff --git a/src/java/org/apache/cassandra/db/index/SecondaryIndex.java b/src/java/org/apache/cassandra/db/index/SecondaryIndex.java
+index 94c36ae..9303549 100644
+--- a/src/java/org/apache/cassandra/db/index/SecondaryIndex.java
++++ b/src/java/org/apache/cassandra/db/index/SecondaryIndex.java
+@@ -18,8 +18,13 @@
+ package org.apache.cassandra.db.index;
+ 
+ import java.nio.ByteBuffer;
+-import java.util.*;
+-import java.util.concurrent.*;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.Iterator;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.Future;
++import java.util.concurrent.FutureTask;
+ 
+ import com.google.common.base.Objects;
+ import org.apache.commons.lang3.StringUtils;
+@@ -28,20 +33,24 @@ import org.slf4j.LoggerFactory;
+ 
+ import org.apache.cassandra.config.CFMetaData;
+ import org.apache.cassandra.config.ColumnDefinition;
+-import org.apache.cassandra.exceptions.ConfigurationException;
++import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.Column;
+ import org.apache.cassandra.db.ColumnFamilyStore;
+ import org.apache.cassandra.db.DecoratedKey;
+ import org.apache.cassandra.db.SystemKeyspace;
+ import org.apache.cassandra.db.compaction.CompactionManager;
+-import org.apache.cassandra.db.index.keys.KeysIndex;
+ import org.apache.cassandra.db.index.composites.CompositesIndex;
++import org.apache.cassandra.db.index.keys.KeysIndex;
+ import org.apache.cassandra.db.marshal.AbstractType;
+ import org.apache.cassandra.db.marshal.BytesType;
+ import org.apache.cassandra.db.marshal.LocalByPartionerType;
+-import org.apache.cassandra.dht.*;
++import org.apache.cassandra.dht.LocalToken;
++import org.apache.cassandra.exceptions.ConfigurationException;
++import org.apache.cassandra.io.sstable.Component;
++import org.apache.cassandra.io.sstable.Descriptor;
+ import org.apache.cassandra.io.sstable.ReducingKeyIterator;
+ import org.apache.cassandra.io.sstable.SSTableReader;
++import org.apache.cassandra.io.sstable.SSTableWriterListener;
+ import org.apache.cassandra.service.StorageService;
+ import org.apache.cassandra.utils.FBUtilities;
+ 
+@@ -55,6 +64,7 @@ public abstract class SecondaryIndex
+     protected static final Logger logger = LoggerFactory.getLogger(SecondaryIndex.class);
+ 
+     public static final String CUSTOM_INDEX_OPTION_NAME = "class_name";
++    private static final long RANGE_RPC_TIMEOUT_MS = DatabaseDescriptor.getRangeRpcTimeout();
+ 
+     public static final AbstractType<?> keyComparator = StorageService.getPartitioner().preservesOrder()
+                                                       ? BytesType.instance
+@@ -252,7 +262,7 @@ public abstract class SecondaryIndex
+         return baseCfs;
+     }
+ 
+-    private void setBaseCfs(ColumnFamilyStore baseCfs)
++    protected void setBaseCfs(ColumnFamilyStore baseCfs)
+     {
+         this.baseCfs = baseCfs;
+     }
+@@ -354,9 +364,9 @@ public abstract class SecondaryIndex
+                 throw new RuntimeException("Unknown index type: " + cdef.getIndexName());
+         }
+ 
++        index.setBaseCfs(baseCfs);
+         index.addColumnDef(cdef);
+         index.validateOptions();
+-        index.setBaseCfs(baseCfs);
+ 
+         return index;
+     }
+@@ -388,4 +398,32 @@ public abstract class SecondaryIndex
+     {
+         return Objects.toStringHelper(this).add("columnDefs", columnDefs).toString();
+     }
++
++    public Collection<Component> getIndexComponents()
++    {
++        return Collections.EMPTY_LIST;
++    }
++
++    public SSTableWriterListener getWriterListener(Descriptor descriptor, SSTableWriterListener.Source source)
++    {
++        return null;
++    }
++
++    public void buildIndexes(Collection<SSTableReader> sstables, Set<String> idxNames)
++    {
++        SecondaryIndexBuilder builder = new SecondaryIndexBuilder(baseCfs, idxNames, new ReducingKeyIterator(sstables));
++        Future<?> future = CompactionManager.instance.submitIndexBuild(builder);
++        FBUtilities.waitOnFuture(future);
++    }
++
++    /**
++     * to be called after a parent column family's sstables have been initially loaded and indexes created/setup,
++     * so that any index may have a chance to create any missing indexes for an sstable.
++     *
++     * @param initialSstables sstables found at process start
++     */
++    public void candidatesForIndexing(Collection<SSTableReader> initialSstables)
++    {
++        //nop
++    }
+ }
+diff --git a/src/java/org/apache/cassandra/db/index/SecondaryIndexBuilder.java b/src/java/org/apache/cassandra/db/index/SecondaryIndexBuilder.java
+index eb09e43..83626f8 100644
+--- a/src/java/org/apache/cassandra/db/index/SecondaryIndexBuilder.java
++++ b/src/java/org/apache/cassandra/db/index/SecondaryIndexBuilder.java
+@@ -31,7 +31,7 @@ import org.apache.cassandra.io.sstable.ReducingKeyIterator;
+ /**
+  * Manages building an entire index from column family data. Runs on to compaction manager.
+  */
+-public class SecondaryIndexBuilder extends CompactionInfo.Holder
++public class SecondaryIndexBuilder extends IndexBuildTask
+ {
+     private final ColumnFamilyStore cfs;
+     private final Set<String> idxNames;
+diff --git a/src/java/org/apache/cassandra/db/index/SecondaryIndexManager.java b/src/java/org/apache/cassandra/db/index/SecondaryIndexManager.java
+index 9bdf260..6cdeb0a 100644
+--- a/src/java/org/apache/cassandra/db/index/SecondaryIndexManager.java
++++ b/src/java/org/apache/cassandra/db/index/SecondaryIndexManager.java
+@@ -18,23 +18,38 @@
+ package org.apache.cassandra.db.index;
+ 
+ import java.nio.ByteBuffer;
+-import java.util.*;
+-import java.util.concurrent.*;
+-
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.IdentityHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentMap;
++import java.util.concurrent.ConcurrentNavigableMap;
++import java.util.concurrent.ConcurrentSkipListMap;
++import java.util.concurrent.Future;
++
++import com.google.common.collect.Sets;
+ import org.apache.commons.lang3.StringUtils;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+ import org.apache.cassandra.config.ColumnDefinition;
+-import org.apache.cassandra.db.*;
+-import org.apache.cassandra.db.compaction.CompactionManager;
++import org.apache.cassandra.db.Column;
++import org.apache.cassandra.db.ColumnFamily;
++import org.apache.cassandra.db.ColumnFamilyStore;
++import org.apache.cassandra.db.DecoratedKey;
++import org.apache.cassandra.db.Row;
++import org.apache.cassandra.db.SystemKeyspace;
+ import org.apache.cassandra.db.filter.ExtendedFilter;
+ import org.apache.cassandra.exceptions.ConfigurationException;
+-import org.apache.cassandra.io.sstable.ReducingKeyIterator;
+ import org.apache.cassandra.io.sstable.SSTableReader;
+ import org.apache.cassandra.thrift.IndexExpression;
+ import org.apache.cassandra.thrift.IndexType;
+-import org.apache.cassandra.utils.FBUtilities;
+ 
+ /**
+  * Manages all the indexes associated with a given CFS
+@@ -131,18 +146,23 @@ public class SecondaryIndexManager
+      */
+     public void maybeBuildSecondaryIndexes(Collection<SSTableReader> sstables, Set<String> idxNames)
+     {
+-        idxNames = filterByColumn(idxNames);
++        // TODO:JEB if the filterByColumn() call is ever reinstated, make sure to enable the test in ColumnFamilyStoreTest
++        //idxNames = filterByColumn(idxNames);
+         if (idxNames.isEmpty())
+             return;        
+ 
+         logger.info(String.format("Submitting index build of %s for data in %s",
+                                   idxNames, StringUtils.join(sstables, ", ")));
+ 
+-        SecondaryIndexBuilder builder = new SecondaryIndexBuilder(baseCfs, idxNames, new ReducingKeyIterator(sstables));
+-        Future<?> future = CompactionManager.instance.submitIndexBuild(builder);
+-        FBUtilities.waitOnFuture(future);
++        Set<String> names = Sets.newHashSet(idxNames);
++        for (SecondaryIndex index : baseCfs.indexManager.getIndexes())
++        {
++            index.buildIndexes(sstables, names);
++            flushIndexesBlocking();
+ 
+-        flushIndexesBlocking();
++            if (names.isEmpty())
++                break;
++        }
+ 
+         logger.info("Index build of " + idxNames + " complete");
+     }
+@@ -506,6 +526,9 @@ public class SecondaryIndexManager
+         //Group columns by type
+         for (IndexExpression ix : clause)
+         {
++            if (ix.getLogicalOp() != null)
++                continue;
++
+             SecondaryIndex index = getIndexForColumn(ix.column_name);
+ 
+             if (index == null)
+@@ -581,6 +604,19 @@ public class SecondaryIndexManager
+         return null;
+     }
+ 
++
++    /**
++     * to be called after a parent column family's sstables have been initially loaded and indexes created/setup,
++     * so that any index may have a chance to create any missing indexes for an sstable.
++     *
++     * @param initialSstables sstables found at process start
++     */
++    public void candidatesForIndexing(Collection<SSTableReader> initialSstables)
++    {
++        for (SecondaryIndex index : allIndexes)
++            index.candidatesForIndexing(initialSstables);
++    }
++
+     private Set<String> filterByColumn(Set<String> idxNames)
+     {
+         Set<SecondaryIndex> indexes = getIndexesByNames(idxNames);
+diff --git a/src/java/org/apache/cassandra/exceptions/ExceptionCode.java b/src/java/org/apache/cassandra/exceptions/ExceptionCode.java
+index ce082a7..c80fccc 100644
+--- a/src/java/org/apache/cassandra/exceptions/ExceptionCode.java
++++ b/src/java/org/apache/cassandra/exceptions/ExceptionCode.java
+@@ -49,14 +49,14 @@ public enum ExceptionCode
+     UNPREPARED      (0x2500);
+ 
+     public final int value;
+-    private static final Map<Integer, ExceptionCode> valueToCode = new HashMap<Integer, ExceptionCode>(ExceptionCode.values().length);
++    private static final Map<Integer, ExceptionCode> valueToCode = new HashMap<>(ExceptionCode.values().length);
+     static
+     {
+         for (ExceptionCode code : ExceptionCode.values())
+             valueToCode.put(code.value, code);
+     }
+ 
+-    private ExceptionCode(int value)
++    ExceptionCode(int value)
+     {
+         this.value = value;
+     }
+diff --git a/src/java/org/apache/cassandra/io/sstable/AbstractSSTableSimpleWriter.java b/src/java/org/apache/cassandra/io/sstable/AbstractSSTableSimpleWriter.java
+index d089770..44aadfd 100644
+--- a/src/java/org/apache/cassandra/io/sstable/AbstractSSTableSimpleWriter.java
++++ b/src/java/org/apache/cassandra/io/sstable/AbstractSSTableSimpleWriter.java
+@@ -22,6 +22,7 @@ import java.io.File;
+ import java.io.FilenameFilter;
+ import java.io.IOException;
+ import java.nio.ByteBuffer;
++import java.util.Collections;
+ import java.util.HashSet;
+ import java.util.Set;
+ import java.util.concurrent.atomic.AtomicInteger;
+@@ -30,6 +31,7 @@ import org.apache.cassandra.config.CFMetaData;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.*;
+ import org.apache.cassandra.db.context.CounterContext;
++import org.apache.cassandra.db.index.SecondaryIndex;
+ import org.apache.cassandra.db.marshal.CompositeType;
+ import org.apache.cassandra.dht.IPartitioner;
+ import org.apache.cassandra.utils.CounterId;
+@@ -60,7 +62,8 @@ public abstract class AbstractSSTableSimpleWriter implements Closeable
+             0, // We don't care about the bloom filter
+             metadata,
+             DatabaseDescriptor.getPartitioner(),
+-            SSTableMetadata.createCollector(metadata.comparator));
++            SSTableMetadata.createCollector(metadata.comparator),
++            Collections.<SecondaryIndex>emptySet());
+     }
+ 
+     // find available generation and pick up filename from that
+diff --git a/src/java/org/apache/cassandra/io/sstable/SSTableWriter.java b/src/java/org/apache/cassandra/io/sstable/SSTableWriter.java
+index 300b0f3..4131325 100644
+--- a/src/java/org/apache/cassandra/io/sstable/SSTableWriter.java
++++ b/src/java/org/apache/cassandra/io/sstable/SSTableWriter.java
+@@ -21,18 +21,17 @@ import java.io.*;
+ import java.nio.ByteBuffer;
+ import java.util.*;
+ 
+-import com.google.common.collect.Sets;
+-
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+ import org.apache.cassandra.config.CFMetaData;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.config.Schema;
+ import org.apache.cassandra.db.*;
+ import org.apache.cassandra.db.compaction.AbstractCompactedRow;
++import org.apache.cassandra.db.compaction.PrecompactedRow;
++import org.apache.cassandra.db.index.SecondaryIndex;
+ import org.apache.cassandra.dht.IPartitioner;
+ import org.apache.cassandra.io.FSWriteError;
+ import org.apache.cassandra.io.compress.CompressedSequentialWriter;
++import org.apache.cassandra.io.sstable.SSTableWriterListener.Source;
+ import org.apache.cassandra.io.util.*;
+ import org.apache.cassandra.service.StorageService;
+ import org.apache.cassandra.utils.ByteBufferUtil;
+@@ -42,6 +41,12 @@ import org.apache.cassandra.utils.IFilter;
+ import org.apache.cassandra.utils.Pair;
+ import org.apache.cassandra.utils.StreamingHistogram;
+ 
++import com.google.common.collect.ImmutableList;
++import com.google.common.collect.Sets;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
+ public class SSTableWriter extends SSTable
+ {
+     private static final Logger logger = LoggerFactory.getLogger(SSTableWriter.class);
+@@ -56,16 +61,19 @@ public class SSTableWriter extends SSTable
+     private FileMark dataMark;
+     private final SSTableMetadata.Collector sstableMetadataCollector;
+ 
+-    public SSTableWriter(String filename, long keyCount)
++    private final List<SSTableWriterListener> listeners;
++
++    public SSTableWriter(String filename, long keyCount, Set<SecondaryIndex> indexes)
+     {
+         this(filename,
+              keyCount,
+              Schema.instance.getCFMetaData(Descriptor.fromFilename(filename)),
+              StorageService.getPartitioner(),
+-             SSTableMetadata.createCollector(Schema.instance.getCFMetaData(Descriptor.fromFilename(filename)).comparator));
++             SSTableMetadata.createCollector(Schema.instance.getCFMetaData(Descriptor.fromFilename(filename)).comparator),
++             indexes);
+     }
+ 
+-    private static Set<Component> components(CFMetaData metadata)
++    private static Set<Component> components(CFMetaData metadata, Set<SecondaryIndex> indexes)
+     {
+         Set<Component> components = new HashSet<Component>(Arrays.asList(Component.DATA,
+                                                                          Component.PRIMARY_INDEX,
+@@ -87,6 +95,10 @@ public class SSTableWriter extends SSTable
+             components.add(Component.DIGEST);
+             components.add(Component.CRC);
+         }
++
++        for (SecondaryIndex secondaryIndex : indexes)
++            components.addAll(secondaryIndex.getIndexComponents());
++
+         return components;
+     }
+ 
+@@ -94,10 +106,22 @@ public class SSTableWriter extends SSTable
+                          long keyCount,
+                          CFMetaData metadata,
+                          IPartitioner<?> partitioner,
+-                         SSTableMetadata.Collector sstableMetadataCollector)
++                         SSTableMetadata.Collector sstableMetadataCollector,
++                         Set<SecondaryIndex> indexes)
++    {
++        this(filename, keyCount, metadata, partitioner, sstableMetadataCollector, SSTableWriterListener.Source.COMPACTION, indexes);
++    }
++
++    public SSTableWriter(String filename,
++        long keyCount,
++        CFMetaData metadata,
++        IPartitioner<?> partitioner,
++        SSTableMetadata.Collector sstableMetadataCollector,
++        Source source,
++        Set<SecondaryIndex> indexes)
+     {
+         super(Descriptor.fromFilename(filename),
+-              components(metadata),
++              components(metadata, indexes),
+               metadata,
+               partitioner);
+         iwriter = new IndexWriter(keyCount);
+@@ -119,6 +143,17 @@ public class SSTableWriter extends SSTable
+         }
+ 
+         this.sstableMetadataCollector = sstableMetadataCollector;
++        List<SSTableWriterListener> listeners = new ArrayList<>();
++        for (SecondaryIndex si : indexes)
++        {
++            SSTableWriterListener listener = si.getWriterListener(descriptor, source);
++            if (listener != null)
++            {
++                listener.begin();
++                listeners.add(listener);
++            }
++        }
++        this.listeners = ImmutableList.copyOf(listeners);
+     }
+ 
+     public void mark()
+@@ -136,12 +171,14 @@ public class SSTableWriter extends SSTable
+     /**
+      * Perform sanity checks on @param decoratedKey and @return the position in the data file before any data is written
+      */
+-    private long beforeAppend(DecoratedKey decoratedKey)
++    private Pair<Long, Long> beforeAppend(DecoratedKey decoratedKey)
+     {
+         assert decoratedKey != null : "Keys must not be null"; // empty keys ARE allowed b/c of indexed column values
+         if (lastWrittenKey != null && lastWrittenKey.compareTo(decoratedKey) >= 0)
+             throw new RuntimeException("Last written key " + lastWrittenKey + " >= current key " + decoratedKey + " writing into " + getFilename());
+-        return (lastWrittenKey == null) ? 0 : dataFile.getFilePointer();
++        long dataPosition = (lastWrittenKey == null) ? 0 : dataFile.getFilePointer();
++        long indexPosition = (lastWrittenKey == null) ? 0 : iwriter.getFilePointer();
++        return Pair.create(indexPosition, dataPosition);
+     }
+ 
+     private void afterAppend(DecoratedKey decoratedKey, long dataPosition, RowIndexEntry index)
+@@ -163,11 +200,11 @@ public class SSTableWriter extends SSTable
+      */
+     public RowIndexEntry append(AbstractCompactedRow row)
+     {
+-        long currentPosition = beforeAppend(row.key);
++        Pair<Long, Long> currentPositions = beforeAppend(row.key);
+         RowIndexEntry entry;
+         try
+         {
+-            entry = row.write(currentPosition, dataFile.stream);
++            entry = row.write(currentPositions, dataFile.stream, listeners);
+             if (entry == null)
+                 return null;
+         }
+@@ -175,8 +212,8 @@ public class SSTableWriter extends SSTable
+         {
+             throw new FSWriteError(e, dataFile.getPath());
+         }
+-        sstableMetadataCollector.update(dataFile.getFilePointer() - currentPosition, row.columnStats());
+-        afterAppend(row.key, currentPosition, entry);
++        sstableMetadataCollector.update(dataFile.getFilePointer() - currentPositions.right, row.columnStats());
++        afterAppend(row.key, currentPositions.right, entry);
+         return entry;
+     }
+ 
+@@ -190,28 +227,7 @@ public class SSTableWriter extends SSTable
+             return;
+         }
+ 
+-        long startPosition = beforeAppend(decoratedKey);
+-        try
+-        {
+-            RowIndexEntry entry = rawAppend(cf, startPosition, decoratedKey, dataFile.stream);
+-            afterAppend(decoratedKey, startPosition, entry);
+-        }
+-        catch (IOException e)
+-        {
+-            throw new FSWriteError(e, dataFile.getPath());
+-        }
+-        sstableMetadataCollector.update(dataFile.getFilePointer() - startPosition, cf.getColumnStats());
+-    }
+-
+-    public static RowIndexEntry rawAppend(ColumnFamily cf, long startPosition, DecoratedKey key, DataOutput out) throws IOException
+-    {
+-        assert cf.getColumnCount() > 0 || cf.isMarkedForDelete();
+-
+-        ColumnIndex.Builder builder = new ColumnIndex.Builder(cf, key.key, out);
+-        ColumnIndex index = builder.build(cf);
+-
+-        out.writeShort(END_OF_ROW);
+-        return RowIndexEntry.create(startPosition, cf.deletionInfo().getTopLevelDeletion(), index);
++        append(new PrecompactedRow(decoratedKey, cf));
+     }
+ 
+     /**
+@@ -220,7 +236,7 @@ public class SSTableWriter extends SSTable
+      */
+     public long appendFromStream(DecoratedKey key, CFMetaData metadata, DataInput in, Descriptor.Version version) throws IOException
+     {
+-        long currentPosition = beforeAppend(key);
++        Pair<Long, Long> currentPositions = beforeAppend(key);
+ 
+         ColumnStats.MaxTracker<Long> maxTimestampTracker = new ColumnStats.MaxTracker<>(Long.MAX_VALUE);
+         ColumnStats.MinTracker<Long> minTimestampTracker = new ColumnStats.MinTracker<>(Long.MIN_VALUE);
+@@ -236,7 +252,9 @@ public class SSTableWriter extends SSTable
+ 
+         cf.delete(DeletionTime.serializer.deserialize(in));
+ 
+-        ColumnIndex.Builder columnIndexer = new ColumnIndex.Builder(cf, key.key, dataFile.stream);
++        for (SSTableWriterListener listener : listeners)
++            listener.startRow(key, currentPositions.left);
++        ColumnIndex.Builder columnIndexer = new ColumnIndex.Builder(cf, key.key, dataFile.stream, listeners);
+ 
+         // read column count for version < ja
+         int columnCount = Integer.MAX_VALUE;
+@@ -299,13 +317,13 @@ public class SSTableWriter extends SSTable
+         sstableMetadataCollector.updateMinTimestamp(minTimestampTracker.get());
+         sstableMetadataCollector.updateMaxTimestamp(maxTimestampTracker.get());
+         sstableMetadataCollector.updateMaxLocalDeletionTime(maxDeletionTimeTracker.get());
+-        sstableMetadataCollector.addRowSize(dataFile.getFilePointer() - currentPosition);
++       sstableMetadataCollector.addRowSize(dataFile.getFilePointer() - currentPositions.right);
+         sstableMetadataCollector.addColumnCount(columnIndexer.writtenAtomCount());
+         sstableMetadataCollector.mergeTombstoneHistogram(tombstones);
+         sstableMetadataCollector.updateMinColumnNames(minColumnNames);
+         sstableMetadataCollector.updateMaxColumnNames(maxColumnNames);
+-        afterAppend(key, currentPosition, RowIndexEntry.create(currentPosition, cf.deletionInfo().getTopLevelDeletion(), columnIndexer.build()));
+-        return currentPosition;
++        afterAppend(key, currentPositions.right, RowIndexEntry.create(currentPositions.right, cf.deletionInfo().getTopLevelDeletion(), columnIndexer.build()));
++        return currentPositions.right;
+     }
+ 
+     /**
+@@ -377,6 +395,9 @@ public class SSTableWriter extends SSTable
+             iwriter.bf.close();
+         // main data, close will truncate if necessary
+         dataFile.close();
++
++        complete();
++
+         // write sstable statistics
+         SSTableMetadata sstableMetadata = sstableMetadataCollector.finalizeMetadata(partitioner.getClass().getCanonicalName(),
+                                                                                     metadata.getBloomFilterFpChance());
+@@ -389,6 +410,12 @@ public class SSTableWriter extends SSTable
+         return Pair.create(rename(descriptor, components), sstableMetadata);
+     }
+ 
++    public void complete()
++    {
++        for (SSTableWriterListener listener : listeners)
++            listener.complete();
++    }
++
+     private static void writeMetadata(Descriptor desc, SSTableMetadata sstableMetadata,  Set<Integer> ancestors)
+     {
+         SequentialWriter out = SequentialWriter.open(new File(desc.filenameFor(SSTable.COMPONENT_STATS)), true);
+@@ -415,7 +442,15 @@ public class SSTableWriter extends SSTable
+     {
+         for (Component component : Sets.difference(components, Sets.newHashSet(Component.DATA, Component.SUMMARY)))
+         {
+-            FileUtils.renameWithConfirm(tmpdesc.filenameFor(component), newdesc.filenameFor(component));
++            String tmpComponentPath = tmpdesc.filenameFor(component);
++
++            // if current component is an SI it doesn't necessary mean that it's going to be present for
++            // given SSTable because indexes are build based on the data contained by SSTable but we still need to
++            // register all of the index components upfront, so we have to check existence here instead of failing rename.
++            if (component.type.equals(Component.Type.SECONDARY_INDEX) && !new File(tmpComponentPath).exists())
++                continue;
++
++            FileUtils.renameWithConfirm(tmpComponentPath, newdesc.filenameFor(component));
+         }
+ 
+         // do -Data last because -Data present should mean the sstable was completely renamed before crash
+@@ -525,10 +560,31 @@ public class SSTableWriter extends SSTable
+             indexFile.resetAndTruncate(mark);
+         }
+ 
++        public long getFilePointer()
++        {
++            return indexFile.getFilePointer();
++        }
++
+         @Override
+         public String toString()
+         {
+             return "IndexWriter(" + descriptor + ")";
+         }
+     }
++
++    private static ColumnFamilyStore getColumnFamilyStore(CFMetaData metadata)
++    {
++        try
++        {
++            // there could be situation when memtable is flushed for ks/cf which has already
++            // been removed from schema, so we need to handle IllegalArgumentException case.
++            return Keyspace.open(metadata.ksName).getColumnFamilyStore(metadata.cfId);
++        }
++        catch (Exception e)
++        {
++            logger.error("Failed to retrieve CFS for {}.{}", metadata.ksName, metadata.cfName, e);
++        }
++
++        return null;
++    }
+ }
+diff --git a/src/java/org/apache/cassandra/io/sstable/SSTableWriterListener.java b/src/java/org/apache/cassandra/io/sstable/SSTableWriterListener.java
+new file mode 100644
+index 0000000..67fbb2d
+--- /dev/null
++++ b/src/java/org/apache/cassandra/io/sstable/SSTableWriterListener.java
+@@ -0,0 +1,50 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.cassandra.io.sstable;
++
++import org.apache.cassandra.db.Column;
++import org.apache.cassandra.db.DecoratedKey;
++
++/**
++ * Observer for events in the lifecycle of writing out an sstable.
++ */
++public interface SSTableWriterListener
++{
++    enum Source { MEMTABLE, COMPACTION }
++
++    /**
++     * called before writing any data to the sstable.
++     */
++    void begin();
++
++    /**
++     * called when a new row in being written to the sstable, but before any columns are processed (see {@code nextColumn(Column)}).
++     */
++    void startRow(DecoratedKey key, long curPosition);
++
++    /**
++     * called after the column is written to the sstable. will be preceded by a call to {@code startRow(DecoratedKey, long)}, and the column should be assumed
++     * to belong to that row.w
++     */
++    void nextColumn(Column column);
++
++    /**
++     * Called when all data is written to the file and it's ready to be finished up.
++     */
++    void complete();
++}
+diff --git a/src/java/org/apache/cassandra/streaming/StreamReader.java b/src/java/org/apache/cassandra/streaming/StreamReader.java
+index ad6a18e..eff6457 100644
+--- a/src/java/org/apache/cassandra/streaming/StreamReader.java
++++ b/src/java/org/apache/cassandra/streaming/StreamReader.java
+@@ -93,6 +93,7 @@ public class StreamReader
+                 // TODO move this to BytesReadTracker
+                 session.progress(desc, ProgressInfo.Direction.IN, in.getBytesRead(), totalSize);
+             }
++            writer.complete();
+             return writer;
+         }
+         catch (Throwable e)
+@@ -113,7 +114,7 @@ public class StreamReader
+             throw new IOException("Insufficient disk space to store " + totalSize + " bytes");
+         desc = Descriptor.fromFilename(cfs.getTempSSTablePath(cfs.directories.getLocationForDisk(localDir)));
+ 
+-        return new SSTableWriter(desc.filenameFor(Component.DATA), estimatedKeys);
++        return new SSTableWriter(desc.filenameFor(Component.DATA), estimatedKeys, cfs.indexManager.getIndexes());
+     }
+ 
+     protected void drain(InputStream dis, long bytesRead) throws IOException
+diff --git a/src/java/org/apache/cassandra/streaming/compress/CompressedStreamReader.java b/src/java/org/apache/cassandra/streaming/compress/CompressedStreamReader.java
+index 219cabb..8a5f86d 100644
+--- a/src/java/org/apache/cassandra/streaming/compress/CompressedStreamReader.java
++++ b/src/java/org/apache/cassandra/streaming/compress/CompressedStreamReader.java
+@@ -86,6 +86,7 @@ public class CompressedStreamReader extends StreamReader
+                     session.progress(desc, ProgressInfo.Direction.IN, cis.getTotalCompressedBytesRead(), totalSize);
+                 }
+             }
++            writer.complete();
+             return writer;
+         }
+         catch (Throwable e)
+diff --git a/src/java/org/apache/cassandra/tools/SSTableImport.java b/src/java/org/apache/cassandra/tools/SSTableImport.java
+index 3135fe6..35f4bb3 100644
+--- a/src/java/org/apache/cassandra/tools/SSTableImport.java
++++ b/src/java/org/apache/cassandra/tools/SSTableImport.java
+@@ -328,11 +328,12 @@ public class SSTableImport
+      */
+     public int importJson(String jsonFile, String keyspace, String cf, String ssTablePath) throws IOException
+     {
++        ColumnFamilyStore cfs = Keyspace.open(keyspace).getColumnFamilyStore(cf);
+         ColumnFamily columnFamily = TreeMapBackedSortedColumns.factory.create(keyspace, cf);
+         IPartitioner<?> partitioner = DatabaseDescriptor.getPartitioner();
+ 
+-        int importedKeys = (isSorted) ? importSorted(jsonFile, columnFamily, ssTablePath, partitioner)
+-                                      : importUnsorted(jsonFile, columnFamily, ssTablePath, partitioner);
++        int importedKeys = (isSorted) ? importSorted(jsonFile, columnFamily, ssTablePath, partitioner, cfs)
++                                      : importUnsorted(jsonFile, columnFamily, ssTablePath, partitioner, cfs);
+ 
+         if (importedKeys != -1)
+             System.out.printf("%d keys imported successfully.%n", importedKeys);
+@@ -340,7 +341,7 @@ public class SSTableImport
+         return importedKeys;
+     }
+ 
+-    private int importUnsorted(String jsonFile, ColumnFamily columnFamily, String ssTablePath, IPartitioner<?> partitioner) throws IOException
++    private int importUnsorted(String jsonFile, ColumnFamily columnFamily, String ssTablePath, IPartitioner<?> partitioner, ColumnFamilyStore cfs) throws IOException
+     {
+         int importedKeys = 0;
+         long start = System.nanoTime();
+@@ -350,7 +351,7 @@ public class SSTableImport
+         Object[] data = parser.readValueAs(new TypeReference<Object[]>(){});
+ 
+         keyCountToImport = (keyCountToImport == null) ? data.length : keyCountToImport;
+-        SSTableWriter writer = new SSTableWriter(ssTablePath, keyCountToImport);
++        SSTableWriter writer = new SSTableWriter(ssTablePath, keyCountToImport, cfs.indexManager.getIndexes());
+ 
+         System.out.printf("Importing %s keys...%n", keyCountToImport);
+ 
+@@ -400,7 +401,7 @@ public class SSTableImport
+     }
+ 
+     private int importSorted(String jsonFile, ColumnFamily columnFamily, String ssTablePath,
+-            IPartitioner<?> partitioner) throws IOException
++                             IPartitioner<?> partitioner, ColumnFamilyStore cfs) throws IOException
+     {
+         int importedKeys = 0; // already imported keys count
+         long start = System.nanoTime();
+@@ -426,7 +427,7 @@ public class SSTableImport
+         System.out.printf("Importing %s keys...%n", keyCountToImport);
+ 
+         parser = getParser(jsonFile); // renewing parser
+-        SSTableWriter writer = new SSTableWriter(ssTablePath, keyCountToImport);
++        SSTableWriter writer = new SSTableWriter(ssTablePath, keyCountToImport, cfs.indexManager.getIndexes());
+ 
+         int lineNumber = 1;
+         DecoratedKey prevStoredKey = null;
+diff --git a/test/unit/org/apache/cassandra/db/ColumnFamilyStoreTest.java b/test/unit/org/apache/cassandra/db/ColumnFamilyStoreTest.java
+index 2bcead8..10c7ffb 100644
+--- a/test/unit/org/apache/cassandra/db/ColumnFamilyStoreTest.java
++++ b/test/unit/org/apache/cassandra/db/ColumnFamilyStoreTest.java
+@@ -34,6 +34,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.io.util.FileUtils;
+ import org.apache.commons.lang3.ArrayUtils;
+ import org.apache.commons.lang3.StringUtils;
++import org.junit.Ignore;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ 
+@@ -1693,12 +1694,12 @@ public class ColumnFamilyStoreTest extends SchemaLoader
+         String ks = "Keyspace1";
+         String cf = "Standard3"; // should be empty
+ 
+-        final CFMetaData cfmeta = Schema.instance.getCFMetaData(ks, cf);
++        final ColumnFamilyStore cfs = Keyspace.open(ks).getColumnFamilyStore(cf);
+         Directories dir = Directories.create(ks, cf);
+         ByteBuffer key = bytes("key");
+ 
+         // 1st sstable
+-        SSTableSimpleWriter writer = new SSTableSimpleWriter(dir.getDirectoryForNewSSTables(), cfmeta, StorageService.getPartitioner());
++        SSTableSimpleWriter writer = new SSTableSimpleWriter(dir.getDirectoryForNewSSTables(), cfs.metadata, StorageService.getPartitioner());
+         writer.newRow(key);
+         writer.addColumn(bytes("col"), bytes("val"), 1);
+         writer.close();
+@@ -1711,17 +1712,18 @@ public class ColumnFamilyStoreTest extends SchemaLoader
+ 
+         // simulate incomplete compaction
+         writer = new SSTableSimpleWriter(dir.getDirectoryForNewSSTables(),
+-                                         cfmeta, StorageService.getPartitioner())
++                                         cfs.metadata, StorageService.getPartitioner())
+         {
+             protected SSTableWriter getWriter()
+             {
+-                SSTableMetadata.Collector collector = SSTableMetadata.createCollector(cfmeta.comparator);
++                SSTableMetadata.Collector collector = SSTableMetadata.createCollector(cfs.metadata.comparator);
+                 collector.addAncestor(sstable1.descriptor.generation); // add ancestor from previously written sstable
+                 return new SSTableWriter(makeFilename(directory, metadata.ksName, metadata.cfName),
+                                          0,
+                                          metadata,
+                                          StorageService.getPartitioner(),
+-                                         collector);
++                                         collector,
++                                         cfs.indexManager.getIndexes());
+             }
+         };
+         writer.newRow(key);
+@@ -1758,26 +1760,27 @@ public class ColumnFamilyStoreTest extends SchemaLoader
+         final String ks = "Keyspace1";
+         final String cf = "Standard4"; // should be empty
+ 
+-        final CFMetaData cfmeta = Schema.instance.getCFMetaData(ks, cf);
++        final ColumnFamilyStore cfs = Keyspace.open(ks).getColumnFamilyStore(cf);
+         Directories dir = Directories.create(ks, cf);
+         ByteBuffer key = bytes("key");
+ 
+         // Write SSTable generation 3 that has ancestors 1 and 2
+         final Set<Integer> ancestors = Sets.newHashSet(1, 2);
+         SSTableSimpleWriter writer = new SSTableSimpleWriter(dir.getDirectoryForNewSSTables(),
+-                                                cfmeta, StorageService.getPartitioner())
++                                                cfs.metadata, StorageService.getPartitioner())
+         {
+             protected SSTableWriter getWriter()
+             {
+-                SSTableMetadata.Collector collector = SSTableMetadata.createCollector(cfmeta.comparator);
++                SSTableMetadata.Collector collector = SSTableMetadata.createCollector(cfs.metadata.comparator);
+                 for (int ancestor : ancestors)
+                     collector.addAncestor(ancestor);
+                 String file = new Descriptor(directory, ks, cf, 3, true).filenameFor(Component.DATA);
+                 return new SSTableWriter(file,
+                                          0,
+-                                         metadata,
++                                         cfs.metadata,
+                                          StorageService.getPartitioner(),
+-                                         collector);
++                                         collector,
++                                         cfs.indexManager.getIndexes());
+             }
+         };
+         writer.newRow(key);
+@@ -2176,6 +2179,7 @@ public class ColumnFamilyStoreTest extends SchemaLoader
+     }
+     
+     @Test
++    @Ignore("ignoring as the change this tests is largely incompatible with SASI")
+     public void testRebuildSecondaryIndex() throws IOException
+     {
+         RowMutation rm;
+diff --git a/test/unit/org/apache/cassandra/db/RowIndexEntryTest.java b/test/unit/org/apache/cassandra/db/RowIndexEntryTest.java
+index 9728f1f..e62037a 100644
+--- a/test/unit/org/apache/cassandra/db/RowIndexEntryTest.java
++++ b/test/unit/org/apache/cassandra/db/RowIndexEntryTest.java
+@@ -18,10 +18,12 @@
+ package org.apache.cassandra.db;
+ 
+ import java.io.IOException;
++import java.util.Collections;
+ 
+ import junit.framework.Assert;
+ import org.apache.cassandra.SchemaLoader;
+ import org.apache.cassandra.config.DatabaseDescriptor;
++import org.apache.cassandra.io.sstable.SSTableWriterListener;
+ import org.apache.cassandra.io.util.DataOutputBuffer;
+ import org.apache.cassandra.utils.ByteBufferUtil;
+ import org.apache.cassandra.utils.FBUtilities;
+@@ -41,7 +43,7 @@ public class RowIndexEntryTest extends SchemaLoader
+ 
+         buffer = new DataOutputBuffer();
+         ColumnFamily cf = ArrayBackedSortedColumns.factory.create("Keyspace1", "Standard1");
+-        ColumnIndex columnIndex = new ColumnIndex.Builder(cf, ByteBufferUtil.bytes("a"), new DataOutputBuffer())
++        ColumnIndex columnIndex = new ColumnIndex.Builder(cf, ByteBufferUtil.bytes("a"), new DataOutputBuffer(), Collections.<SSTableWriterListener>emptyList())
+         {{
+             int idx = 0, size = 0;
+             Column column;
+diff --git a/test/unit/org/apache/cassandra/db/compaction/CompactionsTest.java b/test/unit/org/apache/cassandra/db/compaction/CompactionsTest.java
+index 7da8d92..a8ae15a 100644
+--- a/test/unit/org/apache/cassandra/db/compaction/CompactionsTest.java
++++ b/test/unit/org/apache/cassandra/db/compaction/CompactionsTest.java
+@@ -387,7 +387,8 @@ public class CompactionsTest extends SchemaLoader
+                                                      0,
+                                                      cfs.metadata,
+                                                      StorageService.getPartitioner(),
+-                                                     SSTableMetadata.createCollector(cfs.metadata.comparator));
++                                                     SSTableMetadata.createCollector(cfs.metadata.comparator),
++                                                     cfs.indexManager.getIndexes());
+ 
+ 
+             writer.append(Util.dk("0"), cf);
+@@ -399,7 +400,8 @@ public class CompactionsTest extends SchemaLoader
+                                        0,
+                                        cfs.metadata,
+                                        StorageService.getPartitioner(),
+-                                       SSTableMetadata.createCollector(cfs.metadata.comparator));
++                                       SSTableMetadata.createCollector(cfs.metadata.comparator),
++                                       cfs.indexManager.getIndexes());
+ 
+             writer.append(Util.dk("0"), cf);
+             writer.append(Util.dk("1"), cf);
+diff --git a/test/unit/org/apache/cassandra/io/LazilyCompactedRowTest.java b/test/unit/org/apache/cassandra/io/LazilyCompactedRowTest.java
+index 0cd9622..71155b2 100644
+--- a/test/unit/org/apache/cassandra/io/LazilyCompactedRowTest.java
++++ b/test/unit/org/apache/cassandra/io/LazilyCompactedRowTest.java
+@@ -23,12 +23,13 @@ import java.nio.ByteBuffer;
+ import java.security.MessageDigest;
+ import java.security.NoSuchAlgorithmException;
+ import java.util.Collection;
++import java.util.Collections;
+ import java.util.HashSet;
+ import java.util.List;
+ 
+ import com.google.common.base.Objects;
+-import org.junit.Test;
+ 
++import org.junit.Test;
+ import org.apache.cassandra.SchemaLoader;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.*;
+@@ -41,6 +42,7 @@ import org.apache.cassandra.io.util.MappedFileDataInput;
+ import org.apache.cassandra.net.MessagingService;
+ import org.apache.cassandra.utils.ByteBufferUtil;
+ import org.apache.cassandra.utils.CloseableIterator;
++import org.apache.cassandra.utils.Pair;
+ 
+ import static org.junit.Assert.assertEquals;
+ 
+@@ -89,8 +91,8 @@ public class LazilyCompactedRowTest extends SchemaLoader
+             AbstractCompactedRow row2 = iter2.next();
+             DataOutputBuffer out1 = new DataOutputBuffer();
+             DataOutputBuffer out2 = new DataOutputBuffer();
+-            row1.write(-1, out1);
+-            row2.write(-1, out2);
++            row1.write(Pair.create(-1l, -1l), out1, Collections.EMPTY_SET);
++            row2.write(Pair.create(-1l, -1l), out2, Collections.EMPTY_SET);
+ 
+             File tmpFile1 = File.createTempFile("lcrt1", null);
+             File tmpFile2 = File.createTempFile("lcrt2", null);
+diff --git a/test/unit/org/apache/cassandra/io/compress/CompressedSequentialWriterTest.java b/test/unit/org/apache/cassandra/io/compress/CompressedSequentialWriterTest.java
+index acc4faa..8bf20ff 100644
+--- a/test/unit/org/apache/cassandra/io/compress/CompressedSequentialWriterTest.java
++++ b/test/unit/org/apache/cassandra/io/compress/CompressedSequentialWriterTest.java
+@@ -76,7 +76,7 @@ public class CompressedSequentialWriterTest
+             final String filename = f.getAbsolutePath();
+ 
+             SSTableMetadata.Collector sstableMetadataCollector = SSTableMetadata.createCollector(BytesType.instance).replayPosition(null);
+-            CompressedSequentialWriter writer = new CompressedSequentialWriter( f, filename + ".metadata", false, new CompressionParameters( compressor, 32, Collections.<String, String>emptyMap() ), sstableMetadataCollector);
++            CompressedSequentialWriter writer = new CompressedSequentialWriter( f, filename + ".metadata", false, new CompressionParameters(compressor.getClass().getName(), 32, Collections.<String, String>emptyMap() ), sstableMetadataCollector);
+ 
+             byte[] dataPre = new byte[bytesToTest];
+             byte[] rawPost = new byte[bytesToTest];
+diff --git a/test/unit/org/apache/cassandra/io/sstable/SSTableUtils.java b/test/unit/org/apache/cassandra/io/sstable/SSTableUtils.java
+index feeac7c..f2366e9 100644
+--- a/test/unit/org/apache/cassandra/io/sstable/SSTableUtils.java
++++ b/test/unit/org/apache/cassandra/io/sstable/SSTableUtils.java
+@@ -198,7 +198,8 @@ public class SSTableUtils
+         public SSTableReader write(int expectedSize, Appender appender) throws IOException
+         {
+             File datafile = (dest == null) ? tempSSTableFile(ksname, cfname, generation) : new File(dest.filenameFor(Component.DATA));
+-            SSTableWriter writer = new SSTableWriter(datafile.getAbsolutePath(), expectedSize);
++            ColumnFamilyStore cfs = Keyspace.open(ksname).getColumnFamilyStore(cfname);
++            SSTableWriter writer = new SSTableWriter(datafile.getAbsolutePath(), expectedSize, cfs.indexManager.getIndexes());
+             while (appender.append(writer)) { /* pass */ }
+             SSTableReader reader = writer.closeAndOpenReader();
+             // mark all components for removal
+diff --git a/test/unit/org/apache/cassandra/tools/SSTableExportTest.java b/test/unit/org/apache/cassandra/tools/SSTableExportTest.java
+index d0ab6a2..c66703a 100644
+--- a/test/unit/org/apache/cassandra/tools/SSTableExportTest.java
++++ b/test/unit/org/apache/cassandra/tools/SSTableExportTest.java
+@@ -59,11 +59,15 @@ public class SSTableExportTest extends SchemaLoader
+         return bytesToHex(ByteBufferUtil.bytes(str));
+     }
+     
++    private static final String KEYSPACE = "Keyspace1";
++    private static final String CF_STANDARD1 = "Standard1";
++
+     public SSTableWriter getDummyWriter() throws IOException
+     {
+-        File tempSS = tempSSTableFile("Keyspace1", "Standard1");
+-        ColumnFamily cfamily = TreeMapBackedSortedColumns.factory.create("Keyspace1", "Standard1");
+-        SSTableWriter writer = new SSTableWriter(tempSS.getPath(), 2);
++        File tempSS = tempSSTableFile(KEYSPACE, CF_STANDARD1);
++        ColumnFamily cfamily = TreeMapBackedSortedColumns.factory.create(KEYSPACE, CF_STANDARD1);
++        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(CF_STANDARD1);
++        SSTableWriter writer = new SSTableWriter(tempSS.getPath(), 2, cfs.indexManager.getIndexes());
+ 
+         // Add rowA
+         cfamily.addColumn(ByteBufferUtil.bytes("colA"), ByteBufferUtil.bytes("valA"), System.currentTimeMillis());
+@@ -87,9 +91,10 @@ public class SSTableExportTest extends SchemaLoader
+     @Test
+     public void testEnumeratekeys() throws IOException
+     {
+-        File tempSS = tempSSTableFile("Keyspace1", "Standard1");
+-        ColumnFamily cfamily = TreeMapBackedSortedColumns.factory.create("Keyspace1", "Standard1");
+-        SSTableWriter writer = new SSTableWriter(tempSS.getPath(), 2);
++        File tempSS = tempSSTableFile(KEYSPACE, "Standard1");
++        ColumnFamily cfamily = TreeMapBackedSortedColumns.factory.create(KEYSPACE, CF_STANDARD1);
++        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(CF_STANDARD1);
++        SSTableWriter writer = new SSTableWriter(tempSS.getPath(), 2, cfs.indexManager.getIndexes());
+ 
+         // Add rowA
+         cfamily.addColumn(ByteBufferUtil.bytes("colA"), ByteBufferUtil.bytes("valA"), System.currentTimeMillis());
+@@ -122,9 +127,10 @@ public class SSTableExportTest extends SchemaLoader
+     @Test
+     public void testExportSimpleCf() throws IOException, ParseException
+     {
+-        File tempSS = tempSSTableFile("Keyspace1", "Standard1");
+-        ColumnFamily cfamily = TreeMapBackedSortedColumns.factory.create("Keyspace1", "Standard1");
+-        SSTableWriter writer = new SSTableWriter(tempSS.getPath(), 2);
++        File tempSS = tempSSTableFile(KEYSPACE, "Standard1");
++        ColumnFamily cfamily = TreeMapBackedSortedColumns.factory.create(KEYSPACE, CF_STANDARD1);
++        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(CF_STANDARD1);
++        SSTableWriter writer = new SSTableWriter(tempSS.getPath(), 2, cfs.indexManager.getIndexes());
+ 
+         int nowInSec = (int)(System.currentTimeMillis() / 1000) + 42; //live for 42 seconds
+         // Add rowA
+@@ -177,9 +183,10 @@ public class SSTableExportTest extends SchemaLoader
+     @Test
+     public void testRoundTripStandardCf() throws IOException
+     {
+-        File tempSS = tempSSTableFile("Keyspace1", "Standard1");
+-        ColumnFamily cfamily = TreeMapBackedSortedColumns.factory.create("Keyspace1", "Standard1");
+-        SSTableWriter writer = new SSTableWriter(tempSS.getPath(), 2);
++        File tempSS = tempSSTableFile(KEYSPACE, "Standard1");
++        ColumnFamily cfamily = TreeMapBackedSortedColumns.factory.create(KEYSPACE, CF_STANDARD1);
++        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(CF_STANDARD1);
++        SSTableWriter writer = new SSTableWriter(tempSS.getPath(), 2, cfs.indexManager.getIndexes());
+ 
+         // Add rowA
+         cfamily.addColumn(ByteBufferUtil.bytes("name"), ByteBufferUtil.bytes("val"), System.currentTimeMillis());
+@@ -198,8 +205,8 @@ public class SSTableExportTest extends SchemaLoader
+         SSTableExport.export(reader, new PrintStream(tempJson.getPath()), new String[]{asHex("rowExclude")});
+ 
+         // Import JSON to another SSTable file
+-        File tempSS2 = tempSSTableFile("Keyspace1", "Standard1");
+-        new SSTableImport().importJson(tempJson.getPath(), "Keyspace1", "Standard1", tempSS2.getPath());
++        File tempSS2 = tempSSTableFile(KEYSPACE, "Standard1");
++        new SSTableImport().importJson(tempJson.getPath(), KEYSPACE, "Standard1", tempSS2.getPath());
+ 
+         reader = SSTableReader.open(Descriptor.fromFilename(tempSS2.getPath()));
+         SortedSet<ByteBuffer> names = FBUtilities.singleton(ByteBufferUtil.bytes("name"), cfamily.getComparator());
+@@ -217,9 +224,10 @@ public class SSTableExportTest extends SchemaLoader
+     @Test
+     public void testExportCounterCf() throws IOException, ParseException
+     {
+-        File tempSS = tempSSTableFile("Keyspace1", "Counter1");
+-        ColumnFamily cfamily = TreeMapBackedSortedColumns.factory.create("Keyspace1", "Counter1");
+-        SSTableWriter writer = new SSTableWriter(tempSS.getPath(), 2);
++        File tempSS = tempSSTableFile(KEYSPACE, "Counter1");
++        ColumnFamily cfamily = TreeMapBackedSortedColumns.factory.create(KEYSPACE, "Counter1");
++        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore("Counter1");
++        SSTableWriter writer = new SSTableWriter(tempSS.getPath(), 2, cfs.indexManager.getIndexes());
+ 
+         // Add rowA
+         cfamily.addColumn(new CounterColumn(ByteBufferUtil.bytes("colA"), 42, System.currentTimeMillis()));
+@@ -248,9 +256,10 @@ public class SSTableExportTest extends SchemaLoader
+     @Test
+     public void testEscapingDoubleQuotes() throws IOException, ParseException
+     {
+-        File tempSS = tempSSTableFile("Keyspace1", "ValuesWithQuotes");
+-        ColumnFamily cfamily = TreeMapBackedSortedColumns.factory.create("Keyspace1", "ValuesWithQuotes");
+-        SSTableWriter writer = new SSTableWriter(tempSS.getPath(), 2);
++        File tempSS = tempSSTableFile(KEYSPACE, "ValuesWithQuotes");
++        ColumnFamily cfamily = TreeMapBackedSortedColumns.factory.create(KEYSPACE, "ValuesWithQuotes");
++        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore("ValuesWithQuotes");
++        SSTableWriter writer = new SSTableWriter(tempSS.getPath(), 2, cfs.indexManager.getIndexes());
+ 
+         // Add rowA
+         cfamily.addColumn(new Column(ByteBufferUtil.bytes("data"), UTF8Type.instance.fromString("{\"foo\":\"bar\"}")));
+@@ -280,9 +289,10 @@ public class SSTableExportTest extends SchemaLoader
+     public void testExportColumnsWithMetadata() throws IOException, ParseException
+     {
+ 
+-        File tempSS = tempSSTableFile("Keyspace1", "Standard1");
+-        ColumnFamily cfamily = TreeMapBackedSortedColumns.factory.create("Keyspace1", "Standard1");
+-        SSTableWriter writer = new SSTableWriter(tempSS.getPath(), 2);
++        File tempSS = tempSSTableFile(KEYSPACE, "Standard1");
++        ColumnFamily cfamily = TreeMapBackedSortedColumns.factory.create(KEYSPACE, CF_STANDARD1);
++        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(CF_STANDARD1);
++        SSTableWriter writer = new SSTableWriter(tempSS.getPath(), 2, cfs.indexManager.getIndexes());
+ 
+         // Add rowA
+         cfamily.addColumn(ByteBufferUtil.bytes("colName"), ByteBufferUtil.bytes("val"), System.currentTimeMillis());
+@@ -343,9 +353,10 @@ public class SSTableExportTest extends SchemaLoader
+     @Test
+     public void testColumnNameEqualToDefaultKeyAlias() throws IOException, ParseException
+     {
+-        File tempSS = tempSSTableFile("Keyspace1", "UUIDKeys");
+-        ColumnFamily cfamily = TreeMapBackedSortedColumns.factory.create("Keyspace1", "UUIDKeys");
+-        SSTableWriter writer = new SSTableWriter(tempSS.getPath(), 2);
++        File tempSS = tempSSTableFile(KEYSPACE, "UUIDKeys");
++        ColumnFamily cfamily = TreeMapBackedSortedColumns.factory.create(KEYSPACE, "UUIDKeys");
++        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore("UUIDKeys");
++        SSTableWriter writer = new SSTableWriter(tempSS.getPath(), 2, cfs.indexManager.getIndexes());
+ 
+         // Add a row
+         cfamily.addColumn(column(CFMetaData.DEFAULT_KEY_ALIAS, "not a uuid", 1L));
+diff --git a/test/unit/org/apache/cassandra/triggers/TriggerExecutorTest.java b/test/unit/org/apache/cassandra/triggers/TriggerExecutorTest.java
+index ab7f7c4..6640dee 100644
+--- a/test/unit/org/apache/cassandra/triggers/TriggerExecutorTest.java
++++ b/test/unit/org/apache/cassandra/triggers/TriggerExecutorTest.java
+@@ -19,8 +19,9 @@ package org.apache.cassandra.triggers;
+ 
+ import java.nio.ByteBuffer;
+ import java.util.*;
+-import org.junit.Test;
+ 
++import org.junit.Test;
++import org.apache.cassandra.SchemaLoader;
+ import org.apache.cassandra.config.CFMetaData;
+ import org.apache.cassandra.config.ColumnDefinition;
+ import org.apache.cassandra.config.TriggerDefinition;
+@@ -31,10 +32,9 @@ import org.apache.cassandra.exceptions.ConfigurationException;
+ import org.apache.cassandra.exceptions.InvalidRequestException;
+ 
+ import static org.junit.Assert.*;
+-
+ import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
+ 
+-public class TriggerExecutorTest
++public class TriggerExecutorTest extends SchemaLoader
+ {
+     @Test
+     public void sameKeySameCfColumnFamilies() throws ConfigurationException, InvalidRequestException
+-- 
+2.6.0
+

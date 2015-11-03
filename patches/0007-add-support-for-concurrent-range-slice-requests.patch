@@ -1,0 +1,185 @@
+From 7525156f88124ecb3735aa075e151dd285c12393 Mon Sep 17 00:00:00 2001
+From: Pavel Yaskevich <xedin@apache.org>
+Date: Mon, 2 Nov 2015 16:33:10 -0800
+Subject: [PATCH 07/10] add support for concurrent range slice requests
+
+---
+ .../cassandra/config/DatabaseDescriptor.java       |  10 ++
+ .../org/apache/cassandra/service/StorageProxy.java | 109 +++++++++++++--------
+ 2 files changed, 79 insertions(+), 40 deletions(-)
+
+diff --git a/src/java/org/apache/cassandra/config/DatabaseDescriptor.java b/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+index 3c846f3..246618b 100644
+--- a/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
++++ b/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+@@ -1481,4 +1481,14 @@ public class DatabaseDescriptor
+         String arch = System.getProperty("os.arch");
+         return arch.contains("64") || arch.contains("sparcv9");
+     }
++
++    public static int rangeConcurrencyFactor()
++    {
++        return Integer.valueOf(System.getProperty("cassandra.range_concurrency_factor", "1"));
++    }
++
++    public static int searchConcurrencyFactor()
++    {
++        return Integer.valueOf(System.getProperty("cassandra.search_concurrency_factor", "1"));
++    }
+ }
+diff --git a/src/java/org/apache/cassandra/service/StorageProxy.java b/src/java/org/apache/cassandra/service/StorageProxy.java
+index dff4a3b..67c8827 100644
+--- a/src/java/org/apache/cassandra/service/StorageProxy.java
++++ b/src/java/org/apache/cassandra/service/StorageProxy.java
+@@ -69,6 +69,8 @@ public class StorageProxy implements StorageProxyMBean
+     private static final Logger logger = LoggerFactory.getLogger(StorageProxy.class);
+     static final boolean OPTIMIZE_LOCAL_REQUESTS = true; // set to false to test messagingservice path on single node
+ 
++    private static final int MAX_RANGE_BUCKET_SIZE;
++
+     public static final String UNREACHABLE = "UNREACHABLE";
+ 
+     private static final WritePerformer standardWritePerformer;
+@@ -95,6 +97,11 @@ public class StorageProxy implements StorageProxyMBean
+ 
+     static
+     {
++        int rangeConcurrencyFactor = DatabaseDescriptor.rangeConcurrencyFactor();
++        MAX_RANGE_BUCKET_SIZE = (rangeConcurrencyFactor <= 1) ? 1 : rangeConcurrencyFactor;
++
++        logger.info("Range Concurrency Factor is set to {}", MAX_RANGE_BUCKET_SIZE);
++
+         MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+         try
+         {
+@@ -1520,6 +1527,10 @@ public class StorageProxy implements StorageProxyMBean
+             AbstractBounds<RowPosition> nextRange = null;
+             List<InetAddress> nextEndpoints = null;
+             List<InetAddress> nextFilteredEndpoints = null;
++
++            List<ReadCallback<RangeSliceReply, Iterable<Row>>> concurrentBucket = new LinkedList<>();
++
++            range_slice:
+             while (i < ranges.size())
+             {
+                 AbstractBounds<RowPosition> range = nextRange == null
+@@ -1595,58 +1606,76 @@ public class StorageProxy implements StorageProxyMBean
+                     }
+                 }
+ 
+-                try
++                concurrentBucket.add(handler);
++
++                // bucket is not yet full, so let's do more concurrent requests before waiting
++                if (concurrentBucket.size() < MAX_RANGE_BUCKET_SIZE && ranges.size() - i > 0)
++                    continue;
++
++                for (ReadCallback<RangeSliceReply, Iterable<Row>> rangeHandler : concurrentBucket)
+                 {
+-                    for (Row row : handler.get())
++                    try
+                     {
+-                        rows.add(row);
+-                        if (countLiveRows)
+-                            liveRowCount += row.getLiveCount(command.predicate, command.timestamp);
++                        for (Row row : rangeHandler.get())
++                        {
++                            rows.add(row);
++
++                            if (countLiveRows)
++                                liveRowCount += row.getLiveCount(command.predicate, command.timestamp);
++
++                            // if we're done, great, otherwise, move to the next range
++                            int count = countLiveRows ? liveRowCount : rows.size();
++                            if (count >= nodeCmd.limit())
++                                break range_slice;
++                        }
++
++                        FBUtilities.waitOnFutures(resolver.repairResults, DatabaseDescriptor.getWriteRpcTimeout());
+                     }
+-                    FBUtilities.waitOnFutures(resolver.repairResults, DatabaseDescriptor.getWriteRpcTimeout());
+-                }
+-                catch (ReadTimeoutException ex)
+-                {
+-                    // we timed out waiting for responses
+-                    int blockFor = consistency_level.blockFor(keyspace);
+-                    int responseCount = resolver.responses.size();
+-                    String gotData = responseCount > 0
+-                                     ? resolver.isDataPresent() ? " (including data)" : " (only digests)"
+-                                     : "";
++                    catch (ReadTimeoutException ex)
++                    {
++                        // we timed out waiting for responses
++                        int blockFor = consistency_level.blockFor(keyspace);
++                        int responseCount = resolver.responses.size();
++                        String gotData = responseCount > 0
++                                         ? resolver.isDataPresent() ? " (including data)" : " (only digests)"
++                                         : "";
+ 
+-                    if (Tracing.isTracing())
++                        if (Tracing.isTracing())
++                        {
++                            Tracing.trace("Timed out; received {} of {} responses{} for range {} of {}",
++                                    new Object[]{ responseCount, blockFor, gotData, i, ranges.size() });
++                        }
++                        else if (logger.isDebugEnabled())
++                        {
++                            logger.debug("Range slice timeout; received {} of {} responses{} for range {} of {}",
++                                    responseCount, blockFor, gotData, i, ranges.size());
++                        }
++                        throw ex;
++                    }
++                    catch (TimeoutException ex)
+                     {
+-                        Tracing.trace("Timed out; received {} of {} responses{} for range {} of {}",
+-                                new Object[]{ responseCount, blockFor, gotData, i, ranges.size() });
++                        // We got all responses, but timed out while repairing
++                        int blockFor = consistency_level.blockFor(keyspace);
++                        if (Tracing.isTracing())
++                            Tracing.trace("Timed out while read-repairing after receiving all {} data and digest responses", blockFor);
++                        else
++                            logger.debug("Range slice timeout while read-repairing after receiving all {} data and digest responses", blockFor);
++                        throw new ReadTimeoutException(consistency_level, blockFor-1, blockFor, true);
+                     }
+-                    else if (logger.isDebugEnabled())
++                    catch (DigestMismatchException e)
+                     {
+-                        logger.debug("Range slice timeout; received {} of {} responses{} for range {} of {}",
+-                                responseCount, blockFor, gotData, i, ranges.size());
++                        throw new AssertionError(e); // no digests in range slices yet
+                     }
+-                    throw ex;
+-                }
+-                catch (TimeoutException ex)
+-                {
+-                    // We got all responses, but timed out while repairing
+-                    int blockFor = consistency_level.blockFor(keyspace);
+-                    if (Tracing.isTracing())
+-                        Tracing.trace("Timed out while read-repairing after receiving all {} data and digest responses", blockFor);
+-                    else
+-                        logger.debug("Range slice timeout while read-repairing after receiving all {} data and digest responses", blockFor);
+-                    throw new ReadTimeoutException(consistency_level, blockFor-1, blockFor, true);
+-                }
+-                catch (DigestMismatchException e)
+-                {
+-                    throw new AssertionError(e); // no digests in range slices yet
+                 }
+ 
+-                // if we're done, great, otherwise, move to the next range
+-                int count = countLiveRows ? liveRowCount : rows.size();
+-                if (count >= nodeCmd.limit())
+-                    break;
++                concurrentBucket.clear();
+             }
+         }
++        catch (ReadTimeoutException e)
++        {
++            rangeMetrics.timeouts.mark();
++            throw e;
++        }
+         finally
+         {
+             long latency = System.nanoTime() - startTime;
+-- 
+2.6.0
+
