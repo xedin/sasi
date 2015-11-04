@@ -26,7 +26,9 @@ implementation.
 ## Getting Up and Running
 
 Builds including SASI against 2.0.17 are available
-[here](https://github.com/xedin/sasi/releases).
+[here](https://github.com/xedin/sasi/releases). The included
+`build-sasi.sh` script can also be run from the root of the
+repository, to apply the patches and build the project locally.
 
 ## Using SASI
 
