@@ -871,9 +871,10 @@ necessary to the messaging service.
 The following are items that can be addressed in future updates but are not
 available in this repository or are not currently implemented.
 
-* The cluster must be configured to use a partition that produces
-  `LongToken`s, e.g. `Murmur3Partitioner`. `ByteOrderedPartitioner`
-  and `RandomPartitioner` will not work with SASI.
+* The cluster must be configured to use a partitioner that produces
+  `LongToken`s, e.g. `Murmur3Partitioner`. Other existing partitioners which
+  don't produce LongToken e.g. `ByteOrderedPartitioner` and `RandomPartitioner`
+  will not work with SASI.
 * CQL3 tables are only supported if created with `COMPACT STORAGE` or
   from the CQL2/Thrift interfaces.
 * SASI indexes must be the only indexes defined for a table
