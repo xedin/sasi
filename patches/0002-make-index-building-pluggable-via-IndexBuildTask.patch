@@ -1,0 +1,164 @@
+From 5b44be4bc5dc936c0d9c0e6eff8a2847cc6b399f Mon Sep 17 00:00:00 2001
+From: Pavel Yaskevich <xedin@apache.org>
+Date: Mon, 9 Nov 2015 15:23:34 -0800
+Subject: [PATCH 2/2] make index building pluggable (via IndexBuildTask)
+
+---
+ .../cassandra/db/compaction/CompactionManager.java |  5 +++--
+ src/java/org/apache/cassandra/index/Index.java     | 18 ++++++++++++++++
+ .../org/apache/cassandra/index/IndexBuildTask.java | 25 ++++++++++++++++++++++
+ .../cassandra/index/SecondaryIndexBuilder.java     |  3 +--
+ .../cassandra/index/SecondaryIndexManager.java     | 11 +++++-----
+ 5 files changed, 53 insertions(+), 9 deletions(-)
+ create mode 100644 src/java/org/apache/cassandra/index/IndexBuildTask.java
+
+diff --git a/src/java/org/apache/cassandra/db/compaction/CompactionManager.java b/src/java/org/apache/cassandra/db/compaction/CompactionManager.java
+index 02d6aa1..721b71d 100644
+--- a/src/java/org/apache/cassandra/db/compaction/CompactionManager.java
++++ b/src/java/org/apache/cassandra/db/compaction/CompactionManager.java
+@@ -49,7 +49,7 @@ import org.apache.cassandra.db.view.ViewBuilder;
+ import org.apache.cassandra.dht.Bounds;
+ import org.apache.cassandra.dht.Range;
+ import org.apache.cassandra.dht.Token;
+-import org.apache.cassandra.index.SecondaryIndexBuilder;
++import org.apache.cassandra.index.IndexBuildTask;
+ import org.apache.cassandra.io.sstable.Descriptor;
+ import org.apache.cassandra.io.sstable.ISSTableScanner;
+ import org.apache.cassandra.io.sstable.SSTableRewriter;
+@@ -1259,7 +1259,7 @@ public class CompactionManager implements CompactionManagerMBean
+     /**
+      * Is not scheduled, because it is performing disjoint work from sstable compaction.
+      */
+-    public Future<?> submitIndexBuild(final SecondaryIndexBuilder builder)
++    public Future<?> submitIndexBuild(final IndexBuildTask builder)
+     {
+         Runnable runnable = new Runnable()
+         {
+@@ -1276,6 +1276,7 @@ public class CompactionManager implements CompactionManagerMBean
+                 }
+             }
+         };
++
+         if (executor.isShutdown())
+         {
+             logger.info("Compaction executor has shut down, not submitting index build");
+diff --git a/src/java/org/apache/cassandra/index/Index.java b/src/java/org/apache/cassandra/index/Index.java
+index f1b7341..c8a2b3e 100644
+--- a/src/java/org/apache/cassandra/index/Index.java
++++ b/src/java/org/apache/cassandra/index/Index.java
+@@ -1,5 +1,7 @@
+ package org.apache.cassandra.index;
+ 
++import java.util.Collection;
++import java.util.Collections;
+ import java.util.Optional;
+ import java.util.concurrent.Callable;
+ import java.util.function.BiFunction;
+@@ -17,7 +19,9 @@ import org.apache.cassandra.db.rows.Row;
+ import org.apache.cassandra.exceptions.InvalidRequestException;
+ import org.apache.cassandra.index.transactions.IndexTransaction;
+ import org.apache.cassandra.io.sstable.Descriptor;
++import org.apache.cassandra.io.sstable.ReducingKeyIterator;
+ import org.apache.cassandra.io.sstable.format.SSTableFlushObserver;
++import org.apache.cassandra.io.sstable.format.SSTableReader;
+ import org.apache.cassandra.schema.IndexMetadata;
+ import org.apache.cassandra.utils.concurrent.OpOrder;
+ 
+@@ -188,6 +192,20 @@ public interface Index
+      */
+     public boolean shouldBuildBlocking();
+ 
++    /**
++     * Similar to get{Invalidate, Truncate}Task returns an index build task to use
++     * when building index for a specific collection of SSTables.
++     *
++     * @param cfs store which backs provided sstables.
++     * @param sstables The SSTables to rebuild index for.
++     *
++     * @return Index build task.
++     */
++    default IndexBuildTask getIndexBuildTask(ColumnFamilyStore cfs, Collection<SSTableReader> sstables)
++    {
++        return new SecondaryIndexBuilder(cfs, Collections.singleton(this), new ReducingKeyIterator(sstables));
++    }
++
+     default SSTableFlushObserver getFlushObserver(Descriptor descriptor, OperationType opType)
+     {
+         return null;
+diff --git a/src/java/org/apache/cassandra/index/IndexBuildTask.java b/src/java/org/apache/cassandra/index/IndexBuildTask.java
+new file mode 100644
+index 0000000..6789c47
+--- /dev/null
++++ b/src/java/org/apache/cassandra/index/IndexBuildTask.java
+@@ -0,0 +1,25 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.cassandra.index;
++
++import org.apache.cassandra.db.compaction.CompactionInfo;
++
++public abstract class IndexBuildTask extends CompactionInfo.Holder
++{
++    public abstract void build();
++}
+diff --git a/src/java/org/apache/cassandra/index/SecondaryIndexBuilder.java b/src/java/org/apache/cassandra/index/SecondaryIndexBuilder.java
+index e66f0a3..1bef534 100644
+--- a/src/java/org/apache/cassandra/index/SecondaryIndexBuilder.java
++++ b/src/java/org/apache/cassandra/index/SecondaryIndexBuilder.java
+@@ -17,7 +17,6 @@
+  */
+ package org.apache.cassandra.index;
+ 
+-import java.io.IOException;
+ import java.util.Set;
+ import java.util.UUID;
+ 
+@@ -33,7 +32,7 @@ import org.apache.cassandra.utils.UUIDGen;
+ /**
+  * Manages building an entire index from column family data. Runs on to compaction manager.
+  */
+-public class SecondaryIndexBuilder extends CompactionInfo.Holder
++public class SecondaryIndexBuilder extends IndexBuildTask
+ {
+     private final ColumnFamilyStore cfs;
+     private final Set<Index> indexers;
+diff --git a/src/java/org/apache/cassandra/index/SecondaryIndexManager.java b/src/java/org/apache/cassandra/index/SecondaryIndexManager.java
+index 92b04fe..4aaa179 100644
+--- a/src/java/org/apache/cassandra/index/SecondaryIndexManager.java
++++ b/src/java/org/apache/cassandra/index/SecondaryIndexManager.java
+@@ -338,11 +338,12 @@ public class SecondaryIndexManager implements IndexRegistry
+                     indexes.stream().map(i -> i.getIndexMetadata().name).collect(Collectors.joining(",")),
+                     sstables.stream().map(SSTableReader::toString).collect(Collectors.joining(",")));
+ 
+-        SecondaryIndexBuilder builder = new SecondaryIndexBuilder(baseCfs,
+-                                                                  indexes,
+-                                                                  new ReducingKeyIterator(sstables));
+-        Future<?> future = CompactionManager.instance.submitIndexBuild(builder);
+-        FBUtilities.waitOnFuture(future);
++        List<Future<?>> promises = indexes.stream()
++                                          .map(index -> index.getIndexBuildTask(baseCfs, sstables))
++                                          .map(CompactionManager.instance::submitIndexBuild)
++                                          .collect(Collectors.toList());
++
++        FBUtilities.waitOnFutures(promises);
+ 
+         flushIndexesBlocking(indexes);
+         logger.info("Index build of {} complete",
+-- 
+2.6.0
+
