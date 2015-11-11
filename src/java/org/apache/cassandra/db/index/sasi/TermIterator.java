@@ -103,7 +103,10 @@ public class TermIterator extends RangeIterator<Long, Token>
             for (final SSTableIndex index : perSSTableIndexes)
             {
                 if (!index.reference())
+                {
+                    latch.countDown();
                     continue;
+                }
 
                 // add to referenced right after the reference was acquired,
                 // that helps to release index if something goes bad inside of the search
