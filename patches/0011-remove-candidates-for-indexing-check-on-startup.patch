@@ -1,0 +1,81 @@
+From a69a0aa7a104adbd897bdb56ee9fdc5e137dd012 Mon Sep 17 00:00:00 2001
+From: Pavel Yaskevich <xedin@apache.org>
+Date: Tue, 17 Nov 2015 15:40:11 -0800
+Subject: [PATCH] remove candidates for indexing check on startup
+
+---
+ src/java/org/apache/cassandra/db/ColumnFamilyStore.java     |  5 -----
+ src/java/org/apache/cassandra/db/index/SecondaryIndex.java  | 11 -----------
+ .../apache/cassandra/db/index/SecondaryIndexManager.java    | 13 -------------
+ 3 files changed, 29 deletions(-)
+
+diff --git a/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index 851e12f..abc51a2 100644
+--- a/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -272,10 +272,6 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
+             initialSstables = SSTableReader.openAll(sstableFiles.list().entrySet(), metadata, this.partitioner);
+             data.addInitialSSTables(initialSstables);
+         }
+-        else
+-        {
+-            initialSstables = Collections.emptyList();
+-        }
+
+         if (caching == Caching.ALL || caching == Caching.KEYS_ONLY)
+             CacheService.instance.keyCache.loadSaved(this);
+@@ -296,7 +292,6 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
+             if (info.getIndexType() != null)
+                 indexManager.addIndexedColumn(info);
+         }
+-        indexManager.candidatesForIndexing(initialSstables);
+
+         // register the mbean
+         String type = this.partitioner instanceof LocalPartitioner ? "IndexColumnFamilies" : "ColumnFamilies";
+diff --git a/src/java/org/apache/cassandra/db/index/SecondaryIndex.java b/src/java/org/apache/cassandra/db/index/SecondaryIndex.java
+index 9303549..4c26c9d 100644
+--- a/src/java/org/apache/cassandra/db/index/SecondaryIndex.java
++++ b/src/java/org/apache/cassandra/db/index/SecondaryIndex.java
+@@ -415,15 +415,4 @@ public abstract class SecondaryIndex
+         Future<?> future = CompactionManager.instance.submitIndexBuild(builder);
+         FBUtilities.waitOnFuture(future);
+     }
+-
+-    /**
+-     * to be called after a parent column family's sstables have been initially loaded and indexes created/setup,
+-     * so that any index may have a chance to create any missing indexes for an sstable.
+-     *
+-     * @param initialSstables sstables found at process start
+-     */
+-    public void candidatesForIndexing(Collection<SSTableReader> initialSstables)
+-    {
+-        //nop
+-    }
+ }
+diff --git a/src/java/org/apache/cassandra/db/index/SecondaryIndexManager.java b/src/java/org/apache/cassandra/db/index/SecondaryIndexManager.java
+index 6cdeb0a..99716f6 100644
+--- a/src/java/org/apache/cassandra/db/index/SecondaryIndexManager.java
++++ b/src/java/org/apache/cassandra/db/index/SecondaryIndexManager.java
+@@ -604,19 +604,6 @@ public class SecondaryIndexManager
+         return null;
+     }
+
+-
+-    /**
+-     * to be called after a parent column family's sstables have been initially loaded and indexes created/setup,
+-     * so that any index may have a chance to create any missing indexes for an sstable.
+-     *
+-     * @param initialSstables sstables found at process start
+-     */
+-    public void candidatesForIndexing(Collection<SSTableReader> initialSstables)
+-    {
+-        for (SecondaryIndex index : allIndexes)
+-            index.candidatesForIndexing(initialSstables);
+-    }
+-
+     private Set<String> filterByColumn(Set<String> idxNames)
+     {
+         Set<SecondaryIndex> indexes = getIndexesByNames(idxNames);
+--
+2.6.0
+
