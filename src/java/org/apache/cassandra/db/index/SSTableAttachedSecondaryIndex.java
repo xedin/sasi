@@ -121,6 +121,16 @@ public class SSTableAttachedSecondaryIndex extends PerRowSecondaryIndex implemen
         if (keyValidator == null)
             keyValidator = baseCfs.metadata.getKeyValidator();
 
+        Set<SSTableReader> sstables = baseCfs.getDataTracker().getSSTables();
+        NavigableMap<SSTableReader, Map<ByteBuffer, ColumnIndex>> toRebuild = new TreeMap<>(new Comparator<SSTableReader>()
+        {
+            @Override
+            public int compare(SSTableReader a, SSTableReader b)
+            {
+                return Integer.compare(a.descriptor.generation, b.descriptor.generation);
+            }
+        });
+
         for (ColumnDefinition column : columns)
         {
             ColumnIndex index = indexedColumns.get(column.name);
@@ -129,15 +139,26 @@ public class SSTableAttachedSecondaryIndex extends PerRowSecondaryIndex implemen
                 ColumnIndex newIndex = new ColumnIndex(keyValidator, column, getComparator(column));
                 index = indexedColumns.putIfAbsent(column.name, newIndex);
 
-                if (index == null)
+                if (index != null)
+                    continue;
+
+                // on restart, sstables are loaded into DataTracker before 2I are hooked up (and init() invoked),
+                // so we need to explicitly load sstables per index.
+                for (SSTableReader sstable : newIndex.init(sstables))
                 {
-                    index = newIndex;
-                    // on restart, sstables are loaded into DataTracker before 2I are hooked up (and init() invoked),
-                    // so we need to grab the sstables here
-                    index.update(Collections.<SSTableReader>emptySet(), baseCfs.getDataTracker().getSSTables());
+                    Map<ByteBuffer, ColumnIndex> perSSTable = toRebuild.get(sstable);
+                    if (perSSTable == null)
+                        toRebuild.put(sstable, (perSSTable = new HashMap<>()));
+
+                    perSSTable.put(column.name, newIndex);
                 }
             }
         }
+
+        // schedule rebuild of the missing indexes. Property affects both existing and newly (re-)created
+        // indexes since SecondaryIndex API makes no distinction between them.
+        if (Boolean.parseBoolean(System.getProperty("cassandra.sasi.rebuild_on_start", "true")))
+            CompactionManager.instance.submitIndexBuild(new IndexBuilder(toRebuild));
     }
 
     public AbstractType<?> getKeyValidator()
@@ -266,50 +287,6 @@ public class SSTableAttachedSecondaryIndex extends PerRowSecondaryIndex implemen
         try
         {
             FBUtilities.waitOnFuture(CompactionManager.instance.submitIndexBuild(new IndexBuilder(sstables)));
-        }
-        catch (Exception e)
-        {
-            logger.error("Failed index build task", e);
-        }
-    }
-
-    public void candidatesForIndexing(Collection<SSTableReader> initialSSTables)
-    {
-        if (!Boolean.parseBoolean(System.getProperty("cassandra.sasi.rebuild_on_start", "true")))
-            return;
-
-        logger.info("looking for SASI indexes to rebuild (at start time)");
-
-        NavigableMap<SSTableReader, Map<ByteBuffer, ColumnIndex>> sstables = new TreeMap<>(new Comparator<SSTableReader>()
-        {
-            @Override
-            public int compare(SSTableReader a, SSTableReader b)
-            {
-                return Integer.compare(a.descriptor.generation, b.descriptor.generation);
-            }
-        });
-
-        for (SSTableReader sstable : initialSSTables)
-        {
-            Map<ByteBuffer, ColumnIndex> missingIndexes = new TreeMap<>(baseCfs.getComparator());
-            for (Map.Entry<ByteBuffer, ColumnIndex> e : indexedColumns.entrySet())
-            {
-                ColumnIndex index = e.getValue();
-                File indexFile = new File(index.getPath(sstable.descriptor));
-                if (!indexFile.exists())
-                    missingIndexes.put(e.getKey(), index);
-            }
-
-            if (missingIndexes.isEmpty())
-                continue;
-
-            logger.info("sstable {}: number of missing indexes {}", sstable, missingIndexes.size());
-            sstables.put(sstable, missingIndexes);
-        }
-
-        try
-        {
-            CompactionManager.instance.submitIndexBuild(new IndexBuilder(sstables));
         }
         catch (Exception e)
         {

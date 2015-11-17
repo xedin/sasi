@@ -29,6 +29,11 @@ import org.apache.cassandra.db.index.sasi.conf.view.View;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.io.sstable.SSTableReader;
 
+import com.google.common.base.Function;
+import com.google.common.base.Predicate;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Sets;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -41,11 +46,11 @@ public class DataTracker
     private final ColumnIndex columnIndex;
     private final AtomicReference<View> view = new AtomicReference<>();
 
-    public DataTracker(AbstractType<?> keyValidator, ColumnIndex index, Set<SSTableReader> sstables)
+    public DataTracker(AbstractType<?> keyValidator, ColumnIndex index)
     {
         this.keyValidator = keyValidator;
         this.columnIndex = index;
-        this.view.set(new View(index, keyValidator, getIndexes(sstables)));
+        this.view.set(new View(index, keyValidator, Collections.<SSTableIndex>emptySet()));
     }
 
     public View getView()
@@ -53,9 +58,18 @@ public class DataTracker
         return view.get();
     }
 
-    public void update(Collection<SSTableReader> oldSSTables, Collection<SSTableReader> newSSTables)
+    /**
+     * Replaces old SSTables with new by creating new immutable tracker.
+     *
+     * @param oldSSTables A set of SSTables to remove.
+     * @param newSSTables A set of SSTables to add to tracker.
+     *
+     * @return A collection of SSTables which don't have component attached for current index.
+     */
+    public Iterable<SSTableReader> update(Collection<SSTableReader> oldSSTables, Collection<SSTableReader> newSSTables)
     {
-        Set<SSTableIndex> newIndexes = getIndexes(newSSTables);
+        final Set<SSTableIndex> newIndexes = getIndexes(newSSTables);
+        final Set<SSTableReader> indexedSSTables = getSSTables(newIndexes);
 
         View currentView, newView;
         do
@@ -64,6 +78,15 @@ public class DataTracker
             newView = new View(columnIndex, keyValidator, currentView.getIndexes(), oldSSTables, newIndexes);
         }
         while (!view.compareAndSet(currentView, newView));
+
+        return Iterables.filter(newSSTables, new Predicate<SSTableReader>()
+        {
+            @Override
+            public boolean apply(SSTableReader sstable)
+            {
+                return !indexedSSTables.contains(sstable);
+            }
+        });
     }
 
     public void dropData(long truncateUntil)
@@ -126,5 +149,17 @@ public class DataTracker
         }
 
         return indexes;
+    }
+
+    private Set<SSTableReader> getSSTables(Set<SSTableIndex> indexes)
+    {
+        return Sets.newHashSet(Iterables.transform(indexes, new Function<SSTableIndex, SSTableReader>()
+        {
+            @Override
+            public SSTableReader apply(SSTableIndex index)
+            {
+                return index.getSSTable();
+            }
+        }));
     }
 }

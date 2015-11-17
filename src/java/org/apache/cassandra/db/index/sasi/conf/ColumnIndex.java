@@ -46,13 +46,25 @@ public class ColumnIndex
         this.column = column;
         this.comparator = comparator;
         this.mode = IndexMode.getMode(column);
-        this.tracker = new DataTracker(keyValidator, this, Collections.<SSTableReader>emptySet());
+        this.tracker = new DataTracker(keyValidator, this);
         this.component = new Component(Component.Type.SECONDARY_INDEX, String.format(FILE_NAME_FORMAT, column.getIndexName()));
     }
 
     public void validate() throws ConfigurationException
     {
         mode.validate(column.getIndexOptions());
+    }
+
+    /**
+     * Initialize this column index with specific set of SSTables.
+     *
+     * @param sstables The sstables to be used by index initially.
+     *
+     * @return A collection of sstables which don't have this specific index attached to them.
+     */
+    public Iterable<SSTableReader> init(Set<SSTableReader> sstables)
+    {
+        return tracker.update(Collections.<SSTableReader>emptySet(), sstables);
     }
 
     public void update(Collection<SSTableReader> oldSSTables, Collection<SSTableReader> newSSTables)
