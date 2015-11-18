@@ -204,7 +204,7 @@ public class Operation extends RangeIterator<Long, Token>
      */
     private boolean localSatisfiedBy(Row row, @SuppressWarnings("unused") ColumnNameBuilder builder, boolean allowMissingColumns)
     {
-        if (row == null || row.cf == null || row.cf.isMarkedForDelete())
+        if (row == null || row.cf == null)
             return false;
 
         final long now = System.currentTimeMillis();
