@@ -39,13 +39,8 @@ import org.apache.cassandra.thrift.IndexOperator;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.*;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 public class Operation extends RangeIterator<Long, Token>
 {
-    private static final Logger logger = LoggerFactory.getLogger(Operation.class);
-
     public enum OperationType
     {
         AND, OR;
@@ -306,13 +301,6 @@ public class Operation extends RangeIterator<Long, Token>
             if (columnIndex == null)
             {
                 ColumnDefinition nonIndexedColumn = controller.getColumn(name);
-
-                if (nonIndexedColumn == null)
-                {
-                    logger.error("Requested column: " + comparator.getString(name) + ", wasn't found in the schema.");
-                    continue;
-                }
-
                 columnIndex = new ColumnIndex(controller.getKeyValidator(),
                                               nonIndexedColumn,
                                               controller.getComparator(nonIndexedColumn));

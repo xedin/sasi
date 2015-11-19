@@ -498,7 +498,7 @@ public class OperationTest extends SchemaLoader
         expressions = convert(Operation.analyzeGroup(controller, UTF8Type.instance, OperationType.AND,
                         new ArrayList<IndexExpression>() {{ add(new IndexExpression(notDefined, IndexOperator.EQ, UTF8Type.instance.decompose("a"))); }}));
 
-        Assert.assertEquals(0, expressions.size());
+        Assert.assertEquals(1, expressions.size());
     }
 
     @Test

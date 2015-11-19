@@ -70,7 +70,10 @@ public class QueryController
 
     public ColumnDefinition getColumn(ByteBuffer columnName)
     {
-        return backend.getBaseCfs().metadata.getColumnDefinition(columnName);
+        ColumnDefinition column = backend.getBaseCfs().metadata.getColumnDefinition(columnName);
+        return column != null
+                ? column
+                : ColumnDefinition.regularDef(columnName, backend.getDefaultValidator(), null);
     }
 
     public AbstractType<?> getComparator(ColumnDefinition column)

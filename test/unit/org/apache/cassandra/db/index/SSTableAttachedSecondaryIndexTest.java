@@ -1305,20 +1305,24 @@ public class SSTableAttachedSecondaryIndexTest extends SchemaLoader
 
         final ByteBuffer firstName = UTF8Type.instance.decompose("first_name");
         final ByteBuffer height = UTF8Type.instance.decompose("height");
+        final ByteBuffer undefined = UTF8Type.instance.decompose("undefined");
 
         RowMutation rm = new RowMutation(KS_NAME, AsciiType.instance.decompose("key1"));
         rm.add(CF_NAME, firstName, AsciiType.instance.decompose("pavel"), System.currentTimeMillis());
         rm.add(CF_NAME, height, Int32Type.instance.decompose(10), System.currentTimeMillis());
+        rm.add(CF_NAME, undefined, AsciiType.instance.decompose("hello"), System.currentTimeMillis());
         rm.apply();
 
         rm = new RowMutation(KS_NAME, AsciiType.instance.decompose("key2"));
         rm.add(CF_NAME, firstName, AsciiType.instance.decompose("pavel"), System.currentTimeMillis());
         rm.add(CF_NAME, height, Int32Type.instance.decompose(20), System.currentTimeMillis());
+        rm.add(CF_NAME, undefined, AsciiType.instance.decompose("world"), System.currentTimeMillis());
         rm.apply();
 
         rm = new RowMutation(KS_NAME, AsciiType.instance.decompose("key3"));
         rm.add(CF_NAME, firstName, AsciiType.instance.decompose("pavel"), System.currentTimeMillis());
         rm.add(CF_NAME, height, Int32Type.instance.decompose(30), System.currentTimeMillis());
+        rm.add(CF_NAME, undefined, AsciiType.instance.decompose("hello"), System.currentTimeMillis());
         rm.apply();
 
         store.forceBlockingFlush();
@@ -1345,6 +1349,21 @@ public class SSTableAttachedSecondaryIndexTest extends SchemaLoader
                                      new IndexExpression(height, IndexOperator.GT, Int32Type.instance.decompose(10)),
                                      new IndexExpression(height, IndexOperator.LT, Int32Type.instance.decompose(30)),
                                      new IndexExpression(height, IndexOperator.NOT_EQ, Int32Type.instance.decompose(20)));
+
+        Assert.assertEquals(0, rows.size());
+
+        rows = getIndexed(store, 10, new IndexExpression(firstName, IndexOperator.EQ, UTF8Type.instance.decompose("a")),
+                                     new IndexExpression(undefined, IndexOperator.EQ, AsciiType.instance.decompose("hello")));
+
+        Assert.assertEquals(2, rows.size());
+
+        rows = getIndexed(store, 10, new IndexExpression(firstName, IndexOperator.EQ, UTF8Type.instance.decompose("a")),
+                                     new IndexExpression(undefined, IndexOperator.EQ, AsciiType.instance.decompose("world")));
+
+        Assert.assertEquals(1, rows.size());
+
+        rows = getIndexed(store, 10, new IndexExpression(firstName, IndexOperator.EQ, UTF8Type.instance.decompose("a")),
+                                     new IndexExpression(undefined, IndexOperator.EQ, AsciiType.instance.decompose("empty")));
 
         Assert.assertEquals(0, rows.size());
     }

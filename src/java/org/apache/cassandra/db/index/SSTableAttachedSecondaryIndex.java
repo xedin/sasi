@@ -166,6 +166,11 @@ public class SSTableAttachedSecondaryIndex extends PerRowSecondaryIndex implemen
         return keyValidator;
     }
 
+    public AbstractType<?> getDefaultValidator()
+    {
+        return baseCfs.metadata.getDefaultValidator();
+    }
+
     public AbstractType<?> getComparator(ColumnDefinition column)
     {
         return baseCfs.metadata.getColumnDefinitionComparator(column);
