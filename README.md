@@ -184,28 +184,6 @@ cqlsh:demo> SELECT first_name, last_name, age, height, created_at FROM sasi
 (1 rows)
 ```
 
-SASI also supports multiple predicates joined by `OR` instead of
-`AND`. This is not currently supported by the existing Cassandra
-indexing implementation. `ALLOW FILTERING` again must be specified but
-like the query above the performance concern, due to filtering, is not present.
-
-```
-cqlsh:demo> SELECT * FROM sasi
-        ... WHERE first_name = 'P' OR first_name = 'j' OR first_name = 'M' ALLOW FILTERING;
-
- id                                   | age | created_at    | first_name | height | last_name
---------------------------------------+-----+---------------+------------+--------+-----------
- f5dfcabe-de96-4148-9b80-a1c41ed276b4 |  26 | 1442959315021 |    Michael |    180 |  Kjellman
- 96053844-45c3-4f15-b1b7-b02c441d3ee1 |  36 | 1442959315020 |    Mikhail |    173 |   Stepura
- 6b757016-631d-4fdb-ac62-40b127ccfbc7 |  40 | 1442959315023 |      Jason |    182 |     Brown
- 556ebd54-cbe5-4b75-9aae-bf2a31a24500 |  27 | 1442959315018 |      Pavel |    181 | Yaskevich
- 5770382a-c56f-4f3f-b755-450e24d55217 |  26 | 1442959315019 |     Jordan |    173 |      West
- 2970da43-e070-41a8-8bcb-35df7a0e608a |  32 | 1442959315022 |     Johnny |    175 |     Zhang
-
-(6 rows)
-
-```
-
 #### Suffix Queries
 
 The next example demonstrates `CONTAINS` mode on the `last_name`
