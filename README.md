@@ -732,7 +732,7 @@ the `LookupIntersectionIterator`, otherwise the
 
 The above components are glued together by the
 [`SASIIndex`](https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/index/sasiIndex.java)
-class which sub-classes `PerRowSecondaryIndex`, and is instantiated
+class which implements `SecondaryIndex`, and is instantiated
 per-table containing SASI indexes. It manages all indexes for a table
 via the
 [`sasi.conf.DataTracker`](https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/index/sasi/conf/DataTracker.java)
@@ -740,11 +740,11 @@ and
 [`sasi.conf.view.View`](https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/index/sasi/conf/view/View.java)
 components, controls writing of all indexes for an SSTable via its
 [`PerSSTableIndexWriter`](https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/index/sasi/disk/PerSSTableIndexWriter.java), and initiates searches with
-`LocalSecondaryIndexSearcher`. These classes glue the previously
+`Indexer`. These classes glue the previously
 mentioned indexing components together with Cassandra's SSTable
 life-cycle ensuring indexes are not only written when Memtable's flush
 but also as SSTable's are compacted. For querying, the
-`LocalSecondaryIndexSearcher` does little but defer to
+`Indexer` does little but defer to
 [`QueryPlan`](https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/index/sasi/plan/QueryPlan.java)
 and update e.g. latency metrics exposed by SASI.
 
@@ -756,7 +756,7 @@ described here.
 
 #### SSTable Write Life-cycle Notifications
 
-The `SSTableWriterListener` is an observer pattern-like interface,
+The `SSTableFlushObserver` is an observer pattern-like interface,
 whose sub-classes can register to be notified about events in the
 life-cycle of writing out a SSTable. Sub-classes can be notified when a
 flush begins and ends, as well as when each next row is about to be
@@ -772,15 +772,14 @@ available in this repository or are not currently implemented.
   `LongToken`s, e.g. `Murmur3Partitioner`. Other existing partitioners which
   don't produce LongToken e.g. `ByteOrderedPartitioner` and `RandomPartitioner`
   will not work with SASI.
-* SASI indexes must be the only indexes defined for a table
 * `ALLOW FILTERING`, the requirement of at least one indexes `=`
   expression, and lack of `LIKE` limit SASIs
   feature-set. Modifications to the grammar to allow `SecondaryIndex`
   implementations to enumerate its supported features would allow SASI
   to expose more features without need to support them in other
   implementations.
-* Not Equals and OR support have been removed in this release while changes are made to Cassandra itself
-  to support the,
+* Not Equals and OR support have been removed in this release while
+  changes are made to Cassandra itself to support them.
 
 ### Contributors
 
