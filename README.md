@@ -1,5 +1,7 @@
 # SSTableAttachedSecondaryIndex
 
+### SASI has been incorporated into Apache Cassandra trunk, updated doc is available as [`SASI.md`](https://github.com/apache/cassandra/blob/trunk/doc/SASI.md)
+
 [`SSTableAttachedSecondaryIndex`](https://github.com/xedin/sasi/blob/master/src/java/org/apache/cassandra/db/index/SSTableAttachedSecondaryIndex.java),
 or "SASI" for short, is an implementation of Cassandra's
 `SecondaryIndex` interface that can be used as an alternative to the
